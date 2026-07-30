@@ -12,8 +12,9 @@ Based on [Geoffrey Huntley's Ralph pattern](https://ghuntley.com/ralph/).
 
 - One of the following AI coding tools installed and authenticated:
   - [Amp CLI](https://ampcode.com) (default)
-  - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`npm install -g @anthropic-ai/claude-code`)
+  - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`npm install -g @anthropic-ai/claude-code`) - version 2.1 or newer for streaming output, per-story models and rate-limit pacing; older versions fall back to plain output
 - `jq` installed (`brew install jq` on macOS)
+- `bash` 3.2 or newer (stock macOS bash is fine)
 - A git repository for your project
 
 ## Setup
@@ -121,13 +122,136 @@ Default is 10 iterations. Use `--tool amp` or `--tool claude` to select your AI 
 
 Ralph will:
 1. Create a feature branch (from PRD `branchName`)
-2. Pick the highest priority story where `passes: false`
-3. Implement that single story
+2. **The script** picks the highest priority story where `passes: false`, resolves its
+   `model` tier, and tells the agent to work on exactly that story
+3. The agent implements that single story
 4. Run quality checks (typecheck, tests)
 5. Commit if checks pass
 6. Update `prd.json` to mark story as `passes: true`
 7. Append learnings to `progress.txt`
-8. Repeat until all stories pass or max iterations reached
+8. Read the real 5h/7d rate-limit window and throttle, wait for the reset, or stop
+9. Repeat until all stories pass or max iterations reached
+
+### Options
+
+| Flag | Effect |
+|------|--------|
+| `--tool <amp\|claude>` | agent CLI to run (default `amp`) |
+| `<number>` | max iterations (default 10) |
+| `--story US-00X` | force a specific story |
+| `--no-pace` | disable rate-limit pacing (report only) |
+| `--hard-pct <n>` | 5h window budget percent (default 85) |
+| `--quiet` | do not render the live agent stream |
+| `--dry-run` | render every UI state with fake data, no API calls |
+| `--scenario <name>` | dry-run path: `mixed\|throttle\|hardstop\|ratelimit\|maxturns\|complete` |
+| `--fast` | shorten every sleep to 8s (use with `--dry-run`) |
+| `--explain` | print the resolved config, story and pace decision, then exit |
+
+Exit codes: `0` all stories pass, `1` max iterations reached, `2` rate-limit window
+exhausted, `3` a story made no progress twice in a row, `4` configuration error.
+
+## Per-Story Model Tiers
+
+Every user story carries a `model` tier so mechanical work does not cost the same as a
+cross-cutting refactor:
+
+| Tier | Model | For |
+|------|-------|-----|
+| `low` | `sonnet` | Migrations, seeders, factories, CRUD scaffolding, config, copy - work fully determined by the acceptance criteria |
+| `med` | `opus` | The default. Normal feature work needing a judgment call (200k context) |
+| `max` | `claude-opus-5[1m]` | Wide-but-shallow work that must see many files at once (1M context) |
+
+```json
+{
+  "id": "US-001",
+  "title": "Add priority field to database",
+  "priority": 1,
+  "model": "low",
+  "passes": false
+}
+```
+
+The field is optional: a story without it runs on `med`. `modelTier` and `tier` are
+accepted as aliases. Override the mapping with `RALPH_MODEL_LOW`, `RALPH_MODEL_MED` and
+`RALPH_MODEL_MAX` (model ids age, and `claude-opus-5[1m]` has to be quoted in a shell).
+
+Because the script needs to know the tier *before* it starts the agent, the script - not
+the agent - selects the story, and appends a `## This Iteration` block to the prompt
+naming it. `--tool amp` ignores tiers entirely; amp has no model selector.
+
+The `/ralph` skill assigns the tiers when it converts your PRD, using the heuristics in
+`skills/ralph/SKILL.md`. The short version: default to `med`; use `low` when a competent
+junior could do it from the criteria alone; use `max` only for genuinely wide work. If
+you want `max` because a story is *big*, split the story instead.
+
+## Rate-Limit Pacing
+
+After every iteration Ralph reads how much of your rate-limit window you have burned and
+decides what to do, so a long run does not exhaust your limit unattended.
+
+Sources, in order:
+1. `~/.claude.json` → `cachedUsageUtilization` - the server's own numbers, cached by the
+   Claude Code CLI from its `anthropic-ratelimit-unified-*` response headers. This is the
+   real percentage, includes your other sessions, and carries the exact `resets_at`.
+2. `ccusage blocks --active --json`, if you opt in with `RALPH_USE_CCUSAGE=1`.
+3. `.ralph/usage.jsonl` - Ralph's own ledger, as a rolling 5h sum. Rough; last resort.
+
+Four possible actions:
+
+- **go** - within budget, continue after a short breather.
+- **throttle** - ahead of an even pace across the window, so nap the difference (capped
+  by `RALPH_MAX_SLEEP_S`) and spread the run out.
+- **wait** - the next iteration of this tier would exceed the budget, so sleep until the
+  window resets, with a live countdown, then continue.
+- **stop** - the 7-day limit is nearly gone. Sleeping inside a run cannot fix that, so
+  Ralph stops with exit code 2 rather than cost you a week.
+
+Rate-limit errors are detected from the iteration result and **retried without consuming
+an iteration** (`RALPH_MAX_RETRIES`, default 3), backing off to the window reset.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `RALPH_PACE` | `even` | `even` or `off` |
+| `RALPH_WINDOW_BUDGET_PCT` | `85` | 5h window budget |
+| `RALPH_WEEK_BUDGET_PCT` | `95` | 7-day guard; stops the run |
+| `RALPH_MAX_SLEEP_S` | `900` | cap on a throttle nap |
+| `RALPH_MAX_WAIT_S` | `21600` | cap on waiting for a reset |
+| `RALPH_MIN_DELAY_S` | `5` | breather between iterations |
+| `RALPH_MAX_RETRIES` | `3` | rate-limit retries per story |
+| `RALPH_ITER_BUDGET_USD` | unset | per-iteration `--max-budget-usd` |
+| `RALPH_USE_CCUSAGE` | `0` | also probe `ccusage blocks` |
+
+Costs shown are the API-equivalent price the CLI reports. On a subscription that is
+informational, not what you are billed - the percentages are what matter.
+
+Pacing is turned off automatically for `--tool amp`: every source above measures Claude
+subscription usage, which says nothing about amp's consumption.
+
+## Output and Logs
+
+Each iteration streams what the agent is doing (tool calls, results, narration), then
+prints a summary with duration, turns, tokens, cost, the commit created, whether the
+story flipped to `passes: true`, and the window state.
+
+```
+.ralph/
+├── usage.jsonl                     # append-only ledger, one line per iteration
+└── logs/20260730-114233/
+    ├── iter-05.stream.jsonl        # raw stream-json, full fidelity
+    └── iter-05.stderr.log
+```
+
+`.ralph/` is gitignored. Colour follows `NO_COLOR` / `RALPH_COLOR=always|never` and is
+disabled when stdout is not a terminal; box characters fall back to ASCII on non-UTF-8
+locales.
+
+To iterate on the output without spending anything:
+
+```bash
+./ralph.sh --dry-run --fast              # every UI state, fake data, ~40s, $0
+./ralph.sh --dry-run --scenario hardstop # just the wait-for-reset path
+./ralph.sh --explain                     # real story + real window, no API call
+```
 
 ## Key Files
 
@@ -136,9 +260,11 @@ Ralph will:
 | `ralph.sh` | The bash loop that spawns fresh AI instances (supports `--tool amp` or `--tool claude`) |
 | `prompt.md` | Prompt template for Amp |
 | `CLAUDE.md` | Prompt template for Claude Code |
-| `prd.json` | User stories with `passes` status (the task list) |
+| `prd.json` | User stories with `passes` status and `model` tier (the task list) |
 | `prd.json.example` | Example PRD format for reference |
 | `progress.txt` | Append-only learnings for future iterations |
+| `.ralph/usage.jsonl` | Usage ledger: one line per iteration (gitignored) |
+| `.ralph/logs/` | Raw per-iteration agent transcripts (gitignored) |
 | `skills/prd/` | Skill for generating PRDs (works with Amp and Claude Code) |
 | `skills/ralph/` | Skill for converting PRDs to JSON (works with Amp and Claude Code) |
 | `.claude-plugin/` | Plugin manifest for Claude Code marketplace discovery |
@@ -211,14 +337,20 @@ When all stories have `passes: true`, Ralph outputs `<promise>COMPLETE</promise>
 Check current state:
 
 ```bash
-# See which stories are done
-cat prd.json | jq '.userStories[] | {id, title, passes}'
+# See which stories are done, and on which model tier
+jq '.userStories[] | {id, title, model, passes}' prd.json
 
 # See learnings from previous iterations
 cat progress.txt
 
 # Check git history
 git log --oneline -10
+
+# Cost and window history, last 5 iterations
+jq -s '.[-5:] | .[] | {story, tier, cost_u, pct_delta, subtype}' .ralph/usage.jsonl
+
+# Replay a raw iteration transcript
+jq -R 'fromjson? | select(.type == "result")' .ralph/logs/*/iter-05.stream.jsonl
 ```
 
 ## Customizing the Prompt
