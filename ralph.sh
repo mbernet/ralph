@@ -504,7 +504,10 @@ validate_prd() {
 
 #region session --------------------------------------------------------------
 
+# The three functions below are the only ones that write outside $RALPH_DIR, so each
+# one guards on DRY_RUN itself rather than trusting every caller to remember.
 archive_if_branch_changed() {
+  ((DRY_RUN)) && return 0
   [[ -f "$PRD_FILE" && -f "$LAST_BRANCH_FILE" ]] || return 0
   local current last folder dest
   current="$(jqf "" -r '.branchName // empty' "$PRD_FILE")"
@@ -527,6 +530,7 @@ archive_if_branch_changed() {
 }
 
 track_branch() {
+  ((DRY_RUN)) && return 0
   local current
   current="$(jqf "" -r '.branchName // empty' "$PRD_FILE")"
   [[ -n "$current" ]] && printf '%s\n' "$current" >"$LAST_BRANCH_FILE"
@@ -545,6 +549,7 @@ prune_logs() {
 }
 
 init_progress() {
+  ((DRY_RUN)) && return 0
   [[ -f "$PROGRESS_FILE" ]] && return 0
   {
     echo "# Ralph Progress Log"
@@ -1142,6 +1147,16 @@ pace_enforce() {
 AGENT_PS=()
 AGENT_RC=0
 
+# Always write the raw log; reach stdout only when --quiet is off. Keeps every agent
+# path honouring the flag, and keeps the PIPESTATUS positions identical either way.
+tee_out() { # tee_out <raw log>
+  if ((RALPH_VERBOSE_STREAM)); then
+    tee "$1"
+  else
+    cat >"$1"
+  fi
+}
+
 run_agent_claude() { # run_agent_claude <raw log> <stderr log>
   local raw="$1" errlog="$2"
   local -a flags=(--print --dangerously-skip-permissions)
@@ -1156,7 +1171,7 @@ run_agent_claude() { # run_agent_claude <raw log> <stderr log>
     # it: a rate-limited claude must not abort the run. PIPESTATUS is captured
     # on the very next command, before bash resets it.
     {
-      build_prompt | claude "${flags[@]}" 2>"$errlog" | tee "$raw" | format_stream
+      build_prompt | claude "${flags[@]}" 2>"$errlog" | tee_out "$raw" | format_stream
       AGENT_PS=("${PIPESTATUS[@]}")
     } || true
     AGENT_RC="${AGENT_PS[1]:-1}"
@@ -1165,7 +1180,7 @@ run_agent_claude() { # run_agent_claude <raw log> <stderr log>
     ((rc_fmt != 0 && rc_fmt != 141)) && warn "stream formatter exited $rc_fmt"
   else
     {
-      build_prompt | claude "${flags[@]}" 2>"$errlog" | tee "$raw"
+      build_prompt | claude "${flags[@]}" 2>"$errlog" | tee_out "$raw"
       AGENT_PS=("${PIPESTATUS[@]}")
     } || true
     AGENT_RC="${AGENT_PS[1]:-1}"
@@ -1179,7 +1194,7 @@ run_agent_amp() { # run_agent_amp <raw log> <stderr log>
   # amp has no --model, so tiers are ignored, but it still benefits from being told
   # which story to implement.
   {
-    build_prompt | amp --dangerously-allow-all 2>"$errlog" | tee "$raw" |
+    build_prompt | amp --dangerously-allow-all 2>"$errlog" | tee_out "$raw" |
       awk -v d="$C_DIM" -v r="$C_RESET" -v v="$G_V" '{printf "  %s%s%s %s\n", d, v, r, $0}'
     AGENT_PS=("${PIPESTATUS[@]}")
   } || true
