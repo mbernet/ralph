@@ -3,6 +3,9 @@ prd.json
 progress.txt
 .last-branch
 
+# Ralph runtime state: usage ledger + per-run logs
+.ralph/
+
 # Archive is optional to commit
 # archive/
 

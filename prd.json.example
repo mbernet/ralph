@@ -13,6 +13,7 @@
         "Typecheck passes"
       ],
       "priority": 1,
+      "model": "low",
       "passes": false,
       "notes": ""
     },
@@ -27,6 +28,7 @@
         "Verify in browser using dev-browser skill"
       ],
       "priority": 2,
+      "model": "med",
       "passes": false,
       "notes": ""
     },
@@ -42,6 +44,7 @@
         "Verify in browser using dev-browser skill"
       ],
       "priority": 3,
+      "model": "med",
       "passes": false,
       "notes": ""
     },
@@ -57,8 +60,25 @@
         "Verify in browser using dev-browser skill"
       ],
       "priority": 4,
+      "model": "med",
       "passes": false,
       "notes": ""
+    },
+    {
+      "id": "US-005",
+      "title": "Apply priority sorting to every task list in the app",
+      "description": "As a user, I want high-priority tasks first everywhere tasks appear.",
+      "acceptanceCriteria": [
+        "Every list that renders tasks sorts by priority (high to low) then by existing order",
+        "Covers the board, the search results, the dashboard widget and the export",
+        "No list keeps its own hardcoded sort",
+        "Typecheck passes",
+        "Verify in browser using dev-browser skill"
+      ],
+      "priority": 5,
+      "model": "max",
+      "passes": false,
+      "notes": "Wide but shallow: many call sites, one small change each. That is what max is for."
     }
   ]
 }

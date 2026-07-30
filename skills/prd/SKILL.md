@@ -79,6 +79,8 @@ Each story should be small enough to implement in one focused session.
 ### US-001: [Title]
 **Description:** As a [user], I want [feature] so that [benefit].
 
+**Model tier:** med
+
 **Acceptance Criteria:**
 - [ ] Specific verifiable criterion
 - [ ] Another criterion
@@ -89,6 +91,20 @@ Each story should be small enough to implement in one focused session.
 **Important:** 
 - Acceptance criteria must be verifiable, not vague. "Works correctly" is bad. "Button shows confirmation dialog before deleting" is good.
 - **For any story with UI changes:** Always include "Verify in browser using dev-browser skill" as acceptance criteria. This ensures visual verification of frontend work.
+
+#### Model tier
+
+Each story carries a tier that decides which model implements it. Use `med` unless the
+story is clearly one of the other two:
+
+- **`low`** - mechanical work fully determined by the criteria: migrations, seeders,
+  factories, CRUD scaffolding that mirrors an existing resource, config, copy.
+- **`med`** - the default. Normal feature work needing a judgment call.
+- **`max`** - cross-cutting work that has to see many files at once ("apply X
+  everywhere", "across the app"). Expensive; use sparingly.
+
+If you want `max` because a story is big, split the story instead. The `ralph` skill's
+"Model Tier" section is authoritative and will re-check whatever you put here.
 
 ### 4. Functional Requirements
 Numbered list of specific functionalities:
@@ -161,6 +177,8 @@ Add priority levels to tasks so users can focus on what matters most. Tasks can 
 ### US-001: Add priority field to database
 **Description:** As a developer, I need to store task priority so it persists across sessions.
 
+**Model tier:** low
+
 **Acceptance Criteria:**
 - [ ] Add priority column to tasks table: 'high' | 'medium' | 'low' (default 'medium')
 - [ ] Generate and run migration successfully
@@ -168,6 +186,8 @@ Add priority levels to tasks so users can focus on what matters most. Tasks can 
 
 ### US-002: Display priority indicator on task cards
 **Description:** As a user, I want to see task priority at a glance so I know what needs attention first.
+
+**Model tier:** med
 
 **Acceptance Criteria:**
 - [ ] Each task card shows colored priority badge (red=high, yellow=medium, gray=low)
@@ -178,6 +198,8 @@ Add priority levels to tasks so users can focus on what matters most. Tasks can 
 ### US-003: Add priority selector to task edit
 **Description:** As a user, I want to change a task's priority when editing it.
 
+**Model tier:** med
+
 **Acceptance Criteria:**
 - [ ] Priority dropdown in task edit modal
 - [ ] Shows current priority as selected
@@ -187,6 +209,8 @@ Add priority levels to tasks so users can focus on what matters most. Tasks can 
 
 ### US-004: Filter tasks by priority
 **Description:** As a user, I want to filter the task list to see only high-priority items when I'm focused.
+
+**Model tier:** med
 
 **Acceptance Criteria:**
 - [ ] Filter dropdown with options: All | High | Medium | Low
@@ -238,4 +262,5 @@ Before saving the PRD:
 - [ ] User stories are small and specific
 - [ ] Functional requirements are numbered and unambiguous
 - [ ] Non-goals section defines clear boundaries
+- [ ] Every user story has a **Model tier** line
 - [ ] Saved to `tasks/prd-[feature-name].md`

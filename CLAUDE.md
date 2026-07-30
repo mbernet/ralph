@@ -7,7 +7,10 @@ You are an autonomous coding agent working on a software project.
 1. Read the PRD at `prd.json` (in the same directory as this file)
 2. Read the progress log at `progress.txt` (check Codebase Patterns section first)
 3. Check you're on the correct branch from PRD `branchName`. If not, check it out or create from main.
-4. Pick the **highest priority** user story where `passes: false`
+4. Pick the story to work on: if a `## This Iteration` block appears at the end of
+   these instructions, work on **exactly** the story it names - `ralph.sh` already
+   selected it and started this session on a model sized for it. Otherwise, pick the
+   **highest priority** user story where `passes: false`.
 5. Implement that single user story
 6. Run quality checks (e.g., typecheck, lint, test - use whatever your project requires)
 7. Update CLAUDE.md files if you discover reusable patterns (see below)
@@ -87,12 +90,25 @@ For any story that changes UI, verify it works in the browser if you have browse
 
 If no browser tools are available, note in your progress report that manual browser verification is needed.
 
+## Model Tier
+
+Each story may carry a `model` field (`low`, `med` or `max`) that `ralph.sh` uses to
+pick the model for that iteration. Do NOT edit it while implementing a story.
+
+If a story turns out badly mis-tiered, record it in that story's `notes` (for example
+`"needs max: touches 40 call sites"`) so the next run can act on it - but leave the
+field itself alone.
+
 ## Stop Condition
 
 After completing a user story, check if ALL stories have `passes: true`.
 
 If ALL stories are complete and passing, reply with:
 <promise>COMPLETE</promise>
+
+Emit that token **only as part of your final message**, and only when every story
+passes. Never quote it while explaining or reasoning - `ralph.sh` reads the final
+message to decide whether the run is over.
 
 If there are still stories with `passes: false`, end your response normally (another iteration will pick up the next story).
 
