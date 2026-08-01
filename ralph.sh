@@ -57,6 +57,7 @@ RALPH_MAX_WAIT_S="${RALPH_MAX_WAIT_S:-21600}"             # cap on waiting for a
 RALPH_MIN_DELAY_S="${RALPH_MIN_DELAY_S:-5}"               # breather between iterations
 RALPH_MAX_RETRIES="${RALPH_MAX_RETRIES:-3}"               # retries never consume an iteration
 RALPH_USE_CCUSAGE="${RALPH_USE_CCUSAGE:-0}"               # opt-in secondary window source
+RALPH_WARN_PCT="${RALPH_WARN_PCT:-90}"                    # where the server starts warning
 PACE_OFF_REASON=""                                        # shown in the header when pacing is off
 RALPH_WEIGHTED_BUDGET="${RALPH_WEIGHTED_BUDGET:-4000000}" # ledger-fallback calibration (rough)
 RALPH_ITER_BUDGET_USD="${RALPH_ITER_BUDGET_USD:-}"        # unset = no per-iteration cap
@@ -343,6 +344,7 @@ ${C_BOLD}ralph.sh${C_RESET} - autonomous agent loop over prd.json
     RALPH_MAX_RETRIES         rate-limit retries per story (default 3)
     RALPH_ITER_BUDGET_USD     per-iteration --max-budget-usd (default: none)
     RALPH_USE_CCUSAGE=1       also probe \`ccusage blocks\` for window data
+    RALPH_WARN_PCT            where the server starts warning (default 90)
     RALPH_PROMPT_FILE         explicit loop prompt path
     NO_COLOR / RALPH_COLOR    colour control
 EOF
@@ -770,23 +772,40 @@ format_stream() {
 RES_PRESENT=0 RES_SUBTYPE="missing" RES_IS_ERR=1 RES_TEXT=""
 RES_COST_U=0 RES_TURNS=0 RES_DUR_MS=0
 RES_IN=0 RES_OUT=0 RES_CR=0 RES_CC=0 RES_MODEL="" RES_CTX=0
-RL_STATUS="" RL_RESET=0
+RL_STATUS="" RL_RESET=0 RL_PCT=-1 RL_WEEK_RESET=0 RL_WEEK_PCT=-1
 
-# The stream also carries rate_limit_event records with the server's own reset
-# timestamp (already epoch) and status. Fresher and more direct than the config
-# cache, so it wins when present.
+# The stream carries rate_limit_event records straight from the server:
+#
+#   {"status":"allowed_warning","resetsAt":1785536400,"rateLimitType":"five_hour",
+#    "utilization":0.93,"surpassedThreshold":0.9}
+#
+# That utilization is the real account-wide number, it arrives for free in a
+# stream we already pay for, and it is current to the second - so it beats every
+# cached source. Two things to respect:
+#
+#   - five_hour and seven_day events interleave. Reading the last one blind
+#     lands a 7-day reset (a week out) in the 5h slot.
+#   - utilization only rides along past the warning threshold. Below it the
+#     status is a plain "allowed", which is not a number but is still a ceiling.
 ratelimit_event_parse() { # ratelimit_event_parse <stream log>
   local rec
-  RL_STATUS="" RL_RESET=0
+  RL_STATUS="" RL_RESET=0 RL_PCT=-1 RL_WEEK_RESET=0 RL_WEEK_PCT=-1
   [[ -s "$1" ]] || return 0
-  rec="$(jqf "" -r --arg sep "$US" '
-      fromjson? // empty
-      | select(.type == "rate_limit_event")
-      | .rate_limit_info
-      | [ (.status // ""), ((.resetsAt // 0) | floor | tostring) ] | join($sep)' -R "$1" |
-    tail -1)"
+  rec="$(jq -R -n -r --arg sep "$US" '
+      def pct: if . == null then -1 else (. * 100 | floor) end;
+      [ inputs | fromjson? | select(.type == "rate_limit_event")
+        | .rate_limit_info | select(type == "object") ] as $ev
+      | if ($ev | length) == 0 then empty else
+          ($ev | map(select(.rateLimitType == "five_hour")) | last // {}) as $h
+          | ($ev | map(select(.rateLimitType == "seven_day")) | last // {}) as $w
+          | [ (($ev | last).status // ""),
+              (($h.resetsAt // 0) | floor | tostring),
+              (($h.utilization | pct) | tostring),
+              (($w.resetsAt // 0) | floor | tostring),
+              (($w.utilization | pct) | tostring) ] | join($sep)
+        end' "$1" 2>/dev/null)" || rec=""
   [[ -n "$rec" ]] || return 0
-  IFS="$US" read -r RL_STATUS RL_RESET <<<"$rec"
+  IFS="$US" read -r RL_STATUS RL_RESET RL_PCT RL_WEEK_RESET RL_WEEK_PCT <<<"$rec"
   return 0
 }
 
@@ -934,33 +953,44 @@ _probe_ccusage() {
   return 0
 }
 
-# Rolling 5h sum of our own ledger. Only a rough proxy, hence last in the ladder.
-_probe_ledger() {
-  [[ -s "$LEDGER" ]] || return 1
-  local tsv now weighted oldest n
-  now="$(date +%s)"
-  tsv="$(jqf "" -s -r --argjson now "$now" --argjson win "$WINDOW_S" '
-      [ .[] | select((.ts // 0) >= ($now - $win)) ] as $w
-      | if ($w | length) == 0 then empty else
-          [ ([ $w[].weighted ] | add // 0),
-            ([ $w[].ts ] | min // $now),
-            ($w | length) ] | @tsv
-        end' "$LEDGER")"
-  [[ -n "$tsv" ]] || return 1
-  IFS=$'\t' read -r weighted oldest n <<<"$tsv"
-  WIN_RESET=$((oldest + WINDOW_S))
-  WIN_PCT=$((weighted * 100 / (RALPH_WEIGHTED_BUDGET > 0 ? RALPH_WEIGHTED_BUDGET : 1)))
-  ((WIN_PCT > 100)) && WIN_PCT=100
-  return 0
+# Rough token weighting: output and cache writes cost far more than cache reads.
+# Only meaningful when comparing iterations against each other.
+weighted_tokens() { # weighted_tokens <in> <out> <cache_read> <cache_create>
+  printf '%s' "$((($2 * 5) + $1 + ($4 * 5 / 4) + ($3 / 10)))"
 }
 
-window_probe() { # window_probe [since-epoch]
-  local since="${1:-0}" cfg tsv
+# Our own consumption since <epoch>, as a percentage of the window. Only counts
+# what this ralph run spent, so it is a floor, never the whole picture - it is
+# what fills the gap when no server number is available. The pending argument
+# carries the iteration that has just finished but is not on the ledger yet.
+_ledger_pct_since() { # _ledger_pct_since <epoch> [pending-weighted]
+  local weighted="${2:-0}" logged=0
+  if [[ -s "$LEDGER" ]]; then
+    logged="$(jqf "0" -s -r --argjson from "$1" '
+        [ .[] | select((.ts // 0) >= $from) | .weighted // 0 ] | add // 0' "$LEDGER")"
+    [[ "$logged" =~ ^[0-9]+$ ]] || logged=0
+  fi
+  weighted=$((weighted + logged))
+  printf '%s' "$((weighted * 100 / (RALPH_WEIGHTED_BUDGET > 0 ? RALPH_WEIGHTED_BUDGET : 1)))"
+  ((weighted > 0))
+}
+
+window_probe() { # window_probe [since-epoch] [pending-weighted-tokens]
+  local since="${1:-0}" pending="${2:-0}" cfg tsv now win_start add
+  local rl_reset="$RL_RESET" rl_pct="$RL_PCT" rl_status="$RL_STATUS"
+  local cfg_pct=0 cfg_reset=0 cfg_week=0 cfg_week_reset=0 cfg_fetched=0
   WIN_PCT=0 WIN_RESET=0 WEEK_PCT=0 WEEK_RESET=0 WIN_SRC="none" WIN_FRESH=1 WIN_FETCHED=0
 
   if ((DRY_RUN)); then
     _probe_fake
     return 0
+  fi
+  now="$(date +%s)"
+
+  # Stream data from a window that has already reset describes a window that no
+  # longer exists. Waiting out a reset is exactly when this happens.
+  if ((rl_reset > 0 && rl_reset <= now)); then
+    rl_reset=0 rl_pct=-1 rl_status=""
   fi
 
   cfg="${CLAUDE_CONFIG_DIR:+$CLAUDE_CONFIG_DIR/.claude.json}"
@@ -971,26 +1001,58 @@ window_probe() { # window_probe [since-epoch]
       sleep 1
       tsv="$(_probe_config "$cfg")" || tsv=""
     }
-    if [[ -n "$tsv" ]]; then
-      IFS=$'\t' read -r WIN_PCT WIN_RESET WEEK_PCT WEEK_RESET WIN_FETCHED <<<"$tsv"
-      WIN_SRC="config"
-      ((since > 0 && WIN_FETCHED < since)) && WIN_FRESH=0
-    fi
+    [[ -n "$tsv" ]] &&
+      IFS=$'\t' read -r cfg_pct cfg_reset cfg_week cfg_week_reset cfg_fetched <<<"$tsv"
   fi
 
-  if [[ "$WIN_SRC" == "none" ]] && ((RALPH_USE_CCUSAGE)); then
-    _probe_ccusage && WIN_SRC="ccusage"
+  # Whose reset to trust: the stream's is live, the config's is only as good as
+  # the reading it came with, and an expired one tells us nothing.
+  WIN_RESET="$rl_reset"
+  ((WIN_RESET <= 0 && cfg_reset > now)) && WIN_RESET="$cfg_reset"
+  ((WIN_RESET <= 0)) && WIN_RESET=$((now + WINDOW_S))
+  win_start=$((WIN_RESET - WINDOW_S))
+
+  if ((rl_pct >= 0)); then
+    # The server's own number for this window. Nothing beats it.
+    WIN_PCT="$rl_pct" WIN_SRC="stream" WIN_FETCHED="$now"
+  elif ((cfg_fetched >= win_start && cfg_reset > now)); then
+    # A config reading taken inside the current window is usable as a floor; top
+    # it up with whatever we have spent since it was taken.
+    WIN_PCT="$cfg_pct" WIN_SRC="config" WIN_FETCHED="$cfg_fetched"
+    if add="$(_ledger_pct_since "$cfg_fetched" "$pending")"; then
+      WIN_PCT=$((WIN_PCT + add))
+      WIN_SRC="config+ledger"
+    fi
+    ((since > 0 && cfg_fetched < since)) && WIN_FRESH=0
+  else
+    # The config belongs to a window that has already ended. It is not a floor,
+    # not a ceiling, not stale data to bias from - it is void.
+    if ((RALPH_USE_CCUSAGE)) && _probe_ccusage; then
+      WIN_SRC="ccusage" WIN_FETCHED="$now"
+    elif add="$(_ledger_pct_since "$win_start" "$pending")"; then
+      WIN_PCT="$add" WIN_SRC="ledger" WIN_FETCHED="$now"
+    elif ((rl_reset > 0)); then
+      # No number anywhere, but the server did tell us where the window ends and
+      # that we are under the warning threshold.
+      WIN_PCT=0 WIN_SRC="stream" WIN_FETCHED="$now"
+    fi
+    ((cfg_fetched > 0)) && WIN_FRESH=0
   fi
-  if [[ "$WIN_SRC" == "none" ]]; then
-    _probe_ledger && WIN_SRC="ledger"
+
+  # "allowed" means the server has not raised the warning yet, so we are below
+  # the threshold whatever any cache claims. A ceiling is not much, but it is
+  # enough to stop a dead reading from pausing a run that has barely started.
+  if [[ "$rl_status" == "allowed" ]] && ((WIN_PCT >= RALPH_WARN_PCT)); then
+    WIN_PCT=$((RALPH_WARN_PCT - 1))
   fi
-  # The last rate_limit_event of the stream carries the server's own reset epoch and
-  # is fresher than anything cached, so it wins on the reset time.
-  if ((RL_RESET > 0)); then
-    WIN_RESET="$RL_RESET"
-    [[ "$WIN_SRC" == "none" ]] && WIN_SRC="stream"
+  ((WIN_PCT > 100)) && WIN_PCT=100
+
+  if ((RL_WEEK_PCT >= 0)); then
+    WEEK_PCT="$RL_WEEK_PCT"
+    ((RL_WEEK_RESET > 0)) && WEEK_RESET="$RL_WEEK_RESET"
+  elif ((cfg_week_reset > now)); then
+    WEEK_PCT="$cfg_week" WEEK_RESET="$cfg_week_reset"
   fi
-  ((WIN_RESET <= 0)) && WIN_RESET=$(($(date +%s) + WINDOW_S))
   return 0
 }
 
@@ -1016,6 +1078,7 @@ ledger_append() {
     --argjson cost "${RES_COST_U:-0}" \
     --argjson tin "${RES_IN:-0}" --argjson tout "${RES_OUT:-0}" \
     --argjson cr "${RES_CR:-0}" --argjson cc "${RES_CC:-0}" \
+    --argjson weighted "$(weighted_tokens "${RES_IN:-0}" "${RES_OUT:-0}" "${RES_CR:-0}" "${RES_CC:-0}")" \
     --argjson pbefore "${WIN_PCT_BEFORE:-0}" --argjson pafter "${WIN_PCT:-0}" \
     --argjson pdelta "${WIN_DELTA:-0}" --argjson week "${WEEK_PCT:-0}" \
     --arg wsrc "$WIN_SRC" --arg commit "${ITER_COMMIT:-}" \
@@ -1024,7 +1087,7 @@ ledger_append() {
       model_req: $mreq, model_act: $mact, subtype: $subtype, class: $class,
       dur_s: $dur, turns: $turns, cost_u: $cost,
       in: $tin, out: $tout, cache_read: $cr, cache_create: $cc,
-      weighted: (($tout * 5) + $tin + ($cc * 5 / 4) + ($cr / 10) | floor),
+      weighted: $weighted,
       pct_before: $pbefore, pct_after: $pafter, pct_delta: $pdelta,
       week_pct: $week, win_src: $wsrc, commit: $commit, passed: $passed}' >>"$target"
 }
@@ -1384,8 +1447,8 @@ iteration_summary() {
   if [[ "$WIN_SRC" != "none" ]]; then
     local d=""
     ((WIN_DELTA != 0)) && d="   ${C_GREY}+${WIN_DELTA}% this iteration${C_RESET}"
-    kv "5h window" "$(window_line)$d"
-    ((WIN_FRESH)) || warn "window data is stale (last refreshed $(fmt_clock "$WIN_FETCHED")) - treating $WIN_PCT% as a floor"
+    kv "5h window" "$(window_line)   ${C_GREY}via $WIN_SRC${C_RESET}$d"
+    ((WIN_FRESH)) || warn "no server reading for this window (config cache last refreshed $(fmt_clock "$WIN_FETCHED")) - $WIN_PCT% is our own spend only"
   fi
 
   case "$ITER_CLASS" in
@@ -1440,17 +1503,14 @@ run_iteration() {
     fi
     classify_result "$ERR_LOG"
 
-    # Refresh the window with the iteration's own consumption included.
-    window_probe "$start"
+    # Refresh the window. The ledger row for this iteration is written further
+    # down, so hand the probe its cost to fold in.
+    window_probe "$start" \
+      "$(weighted_tokens "${RES_IN:-0}" "${RES_OUT:-0}" "${RES_CR:-0}" "${RES_CC:-0}")"
     if ((WIN_PCT >= WIN_PCT_BEFORE)); then
       WIN_DELTA=$((WIN_PCT - WIN_PCT_BEFORE))
     else
       WIN_DELTA="$WIN_PCT" # the window reset mid-iteration
-    fi
-    # A stale reading cannot see this iteration; bias upward rather than overspend.
-    if ((WIN_FRESH == 0)) && [[ "$WIN_SRC" == "config" ]]; then
-      WIN_PCT=$((WIN_PCT + $(ledger_tier_avg_pct "$STORY_TIER")))
-      ((WIN_PCT > 100)) && WIN_PCT=100
     fi
 
     head_after="$(git_head)"
@@ -1757,6 +1817,10 @@ main() {
   esac
 }
 
-main "$@"
+# Sourcing the script loads the functions without running the loop, so the test
+# suite can exercise them directly.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
 
 #endregion

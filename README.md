@@ -190,11 +190,24 @@ After every iteration Ralph reads how much of your rate-limit window you have bu
 decides what to do, so a long run does not exhaust your limit unattended.
 
 Sources, in order:
-1. `~/.claude.json` → `cachedUsageUtilization` - the server's own numbers, cached by the
-   Claude Code CLI from its `anthropic-ratelimit-unified-*` response headers. This is the
-   real percentage, includes your other sessions, and carries the exact `resets_at`.
-2. `ccusage blocks --active --json`, if you opt in with `RALPH_USE_CCUSAGE=1`.
-3. `.ralph/usage.jsonl` - Ralph's own ledger, as a rolling 5h sum. Rough; last resort.
+1. The `rate_limit_event` records in the agent's own output stream. They come straight
+   from the server - `utilization`, `resetsAt` and `rateLimitType` - so they are live,
+   account-wide (every project and session you have open counts) and free: no extra call.
+   The catch is that `utilization` only rides along once you pass the warning threshold
+   (`RALPH_WARN_PCT`, 90%). Below it the status is a plain `allowed`, which is not a
+   number but is still a ceiling - and a ceiling is enough to veto a stale reading.
+2. `~/.claude.json` → `cachedUsageUtilization`, the numbers the Claude Code CLI caches
+   from its `anthropic-ratelimit-unified-*` response headers. Used **only** when its
+   `fetchedAtMs` falls inside the window that is currently open; some CLI builds leave
+   this cache frozen for days, and a reading from a window that has already reset is not
+   a floor, a ceiling or stale data to bias from - it is void. When it is usable, Ralph
+   tops it up with its own spend since it was taken.
+3. `ccusage blocks --active --json`, if you opt in with `RALPH_USE_CCUSAGE=1`.
+4. `.ralph/usage.jsonl` - Ralph's own ledger, summed over the open window. This one only
+   sees what Ralph itself spent, so it is a floor, never the whole picture. Last resort.
+
+The source in play is printed after every iteration (`via stream`, `via config+ledger`…),
+and a run with no server reading at all says so rather than pacing on a guess.
 
 Four possible actions:
 
@@ -220,6 +233,7 @@ an iteration** (`RALPH_MAX_RETRIES`, default 3), backing off to the window reset
 | `RALPH_MAX_RETRIES` | `3` | rate-limit retries per story |
 | `RALPH_ITER_BUDGET_USD` | unset | per-iteration `--max-budget-usd` |
 | `RALPH_USE_CCUSAGE` | `0` | also probe `ccusage blocks` |
+| `RALPH_WARN_PCT` | `90` | where the server starts warning |
 
 Costs shown are the API-equivalent price the CLI reports. On a subscription that is
 informational, not what you are billed - the percentages are what matter.
@@ -351,7 +365,17 @@ jq -s '.[-5:] | .[] | {story, tier, cost_u, pct_delta, subtype}' .ralph/usage.js
 
 # Replay a raw iteration transcript
 jq -R 'fromjson? | select(.type == "result")' .ralph/logs/*/iter-05.stream.jsonl
+
+# What the server actually said about the window, iteration by iteration
+./tests/replay.sh /path/to/project/.ralph
 ```
+
+If pacing looks wrong - pauses that make no sense, or none when the limit is clearly
+close - `replay.sh` is the place to start: it shows the server's own reading next to the
+percentage that run recorded at the time. The two drifting apart means Ralph was pacing
+on a source that had gone cold.
+
+Run the test suite with `./tests/window.test.sh`.
 
 ## Customizing the Prompt
 
