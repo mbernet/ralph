@@ -34,6 +34,7 @@ ARCHIVE_DIR="$SCRIPT_DIR/archive"
 LAST_BRANCH_FILE="$SCRIPT_DIR/.last-branch"
 RALPH_DIR="${RALPH_DIR:-$SCRIPT_DIR/.ralph}"
 LEDGER="$RALPH_DIR/usage.jsonl"
+PROBE_CACHE="$RALPH_DIR/usage-probe.json"
 LEDGER_SHOWN="$LEDGER" # dry runs write to a separate file; this is what we report
 RUN_ID="$(date +%Y%m%d-%H%M%S)"
 LOG_DIR="$RALPH_DIR/logs/$RUN_ID"
@@ -56,10 +57,12 @@ RALPH_MAX_SLEEP_S="${RALPH_MAX_SLEEP_S:-900}"             # cap on a throttle na
 RALPH_MAX_WAIT_S="${RALPH_MAX_WAIT_S:-21600}"             # cap on waiting for a reset
 RALPH_MIN_DELAY_S="${RALPH_MIN_DELAY_S:-5}"               # breather between iterations
 RALPH_MAX_RETRIES="${RALPH_MAX_RETRIES:-3}"               # retries never consume an iteration
-RALPH_USE_CCUSAGE="${RALPH_USE_CCUSAGE:-0}"               # opt-in secondary window source
 RALPH_WARN_PCT="${RALPH_WARN_PCT:-90}"                    # where the server starts warning
 PACE_OFF_REASON=""                                        # shown in the header when pacing is off
-RALPH_WEIGHTED_BUDGET="${RALPH_WEIGHTED_BUDGET:-4000000}" # ledger-fallback calibration (rough)
+RALPH_USAGE_PROBE="${RALPH_USAGE_PROBE:-1}"               # ask the API for the real numbers
+RALPH_PROBE_MODEL="${RALPH_PROBE_MODEL:-claude-haiku-4-5-20251001}"
+RALPH_PROBE_TTL_S="${RALPH_PROBE_TTL_S:-60}"              # reuse a reading for this long
+RALPH_API_BASE="${RALPH_API_BASE:-https://api.anthropic.com}"
 RALPH_ITER_BUDGET_USD="${RALPH_ITER_BUDGET_USD:-}"        # unset = no per-iteration cap
 
 WINDOW_S=18000  # 5 hours
@@ -343,8 +346,10 @@ ${C_BOLD}ralph.sh${C_RESET} - autonomous agent loop over prd.json
     RALPH_MAX_WAIT_S          cap on waiting for a window reset (default 21600)
     RALPH_MAX_RETRIES         rate-limit retries per story (default 3)
     RALPH_ITER_BUDGET_USD     per-iteration --max-budget-usd (default: none)
-    RALPH_USE_CCUSAGE=1       also probe \`ccusage blocks\` for window data
     RALPH_WARN_PCT            where the server starts warning (default 90)
+    RALPH_USAGE_PROBE=0       don't ask the API for the real window usage
+    RALPH_PROBE_MODEL         model for that probe (default haiku)
+    RALPH_PROBE_TTL_S         how long a probe reading is reused (default 60)
     RALPH_PROMPT_FILE         explicit loop prompt path
     NO_COLOR / RALPH_COLOR    colour control
 EOF
@@ -892,7 +897,7 @@ classify_result() { # classify_result <stderr log>
 
 #region usage ----------------------------------------------------------------
 
-WIN_PCT=0 WIN_RESET=0 WEEK_PCT=0 WEEK_RESET=0 WIN_SRC="none" WIN_FRESH=1 WIN_FETCHED=0
+WIN_PCT=0 WIN_RESET=0 WEEK_PCT=0 WEEK_RESET=0 WIN_SRC="none" WIN_FRESH=1 WIN_FETCHED=0 WIN_SPEND_U=0
 
 # The CLI caches the server's own rate-limit numbers (from the
 # anthropic-ratelimit-unified-* response headers) in ~/.claude.json. That beats
@@ -916,81 +921,116 @@ _probe_config() { # _probe_config <config path>
       ] | @tsv' "$1" 2>/dev/null
 }
 
-_probe_ccusage() {
-  local cmd out tsv
-  if command -v ccusage >/dev/null; then
-    cmd=(ccusage)
-  elif command -v bunx >/dev/null; then
-    cmd=(bunx "ccusage@latest")
-  elif command -v npx >/dev/null; then
-    cmd=(npx -y "ccusage@latest")
+# Where Claude Code keeps the subscription token: the macOS keychain, or a plain
+# file everywhere else. An explicit API key wins if there is one.
+_auth_header() {
+  local raw="" tok=""
+  if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+    printf 'x-api-key: %s' "$ANTHROPIC_API_KEY"
+    return 0
+  fi
+  if [[ -r "$HOME/.claude/.credentials.json" ]]; then
+    raw="$(cat "$HOME/.claude/.credentials.json")"
+  elif command -v security >/dev/null; then
+    raw="$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)" || return 1
   else
     return 1
   fi
-  out="$("${cmd[@]}" blocks --active --json 2>/dev/null)" || return 1
-  # Two output shapes are documented across versions; accept both.
-  tsv="$(jqf "" -r '
-      def ep: (. // "") | tostring
-        | if . == "" or . == "null" then 0
-          else (sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601) end;
-      ((.blocks // .data // []) | map(select(.isActive == true)) | first) as $a
-      | if $a == null then empty else
-          [ (($a.endTime // $a.blockEnd) | ep),
-            ($a.totalTokens
-             // (($a.tokenCounts.inputTokens // $a.inputTokens // 0)
-               + ($a.tokenCounts.outputTokens // $a.outputTokens // 0)
-               + ($a.tokenCounts.cacheCreationInputTokens // $a.cacheCreationTokens // 0)
-               + ($a.tokenCounts.cacheReadInputTokens // $a.cacheReadTokens // 0)))
-          ] | @tsv
-        end' <<<"$out")"
-  [[ -n "$tsv" ]] || return 1
-  local end tokens
-  IFS=$'\t' read -r end tokens <<<"$tsv"
-  ((end > 0)) || return 1
-  WIN_RESET="$end"
-  WIN_PCT=$((tokens * 100 / (RALPH_WEIGHTED_BUDGET > 0 ? RALPH_WEIGHTED_BUDGET : 1)))
-  ((WIN_PCT > 100)) && WIN_PCT=100
+  tok="$(jqf "" -r '.claudeAiOauth.accessToken // empty' <<<"$raw")"
+  [[ -n "$tok" ]] || return 1
+  printf 'authorization: Bearer %s' "$tok"
+}
+
+# The real numbers, straight from the anthropic-ratelimit-unified-* headers that
+# ride along with every API response. The CLI only forwards a percentage to the
+# stream once it is past the warning threshold, and its ~/.claude.json cache can
+# sit frozen for days, so ralph asks for itself: one haiku call capped at a
+# single output token, for the headers that come back with it.
+PROBE_PCT=-1 PROBE_RESET=0 PROBE_WEEK_PCT=-1 PROBE_WEEK_RESET=0
+_hdr_val() { # _hdr_val <headers> <name>
+  printf '%s' "$1" | tr -d '\r' |
+    sed -n "s/^[Aa]nthropic-[Rr]ate[Ll]imit-unified-$2: *//p" | tail -1
+}
+
+_probe_headers() {
+  local auth hdr body cached now u r wu wr
+  PROBE_PCT=-1 PROBE_RESET=0 PROBE_WEEK_PCT=-1 PROBE_WEEK_RESET=0
+  ((RALPH_USAGE_PROBE)) || return 1
+  command -v curl >/dev/null || return 1
+  now="$(date +%s)"
+
+  # window_probe runs a few times per iteration; one reading covers them all.
+  if [[ -s "$PROBE_CACHE" ]]; then
+    cached="$(jqf "" -r --argjson now "$now" --argjson ttl "$RALPH_PROBE_TTL_S" \
+        'select(($now - (.ts // 0)) < $ttl and (.pct // -1) >= 0)
+         | [.pct, .reset, .week_pct, .week_reset] | @tsv' "$PROBE_CACHE")"
+    if [[ -n "$cached" ]]; then
+      IFS=$'\t' read -r PROBE_PCT PROBE_RESET PROBE_WEEK_PCT PROBE_WEEK_RESET <<<"$cached"
+      return 0
+    fi
+  fi
+
+  auth="$(_auth_header)" || return 1
+  body='{"model":"'"$RALPH_PROBE_MODEL"'","max_tokens":1,'
+  body+='"system":[{"type":"text","text":"You are Claude Code, Anthropic'"'"'s official CLI for Claude."}],'
+  body+='"messages":[{"role":"user","content":"hi"}]}'
+  hdr="$(curl -sS --max-time 20 -D - -X POST "$RALPH_API_BASE/v1/messages" \
+      -H "$auth" \
+      -H "anthropic-version: 2023-06-01" \
+      -H "anthropic-beta: oauth-2025-04-20" \
+      -H "content-type: application/json" \
+      -d "$body" 2>/dev/null)" || return 1
+
+  u="$(_hdr_val "$hdr" 5h-utilization)"
+  r="$(_hdr_val "$hdr" 5h-reset)"
+  wu="$(_hdr_val "$hdr" 7d-utilization)"
+  wr="$(_hdr_val "$hdr" 7d-reset)"
+  [[ "$u" =~ ^[0-9.]+$ ]] || return 1
+  PROBE_PCT="$(awk -v v="$u" 'BEGIN{printf "%d", v * 100}')"
+  [[ "$r" =~ ^[0-9]+$ ]] && PROBE_RESET="$r"
+  [[ "$wu" =~ ^[0-9.]+$ ]] && PROBE_WEEK_PCT="$(awk -v v="$wu" 'BEGIN{printf "%d", v * 100}')"
+  [[ "$wr" =~ ^[0-9]+$ ]] && PROBE_WEEK_RESET="$wr"
+
+  mkdir -p "$RALPH_DIR"
+  jq -nc --argjson ts "$now" --argjson pct "$PROBE_PCT" --argjson reset "$PROBE_RESET" \
+    --argjson week_pct "$PROBE_WEEK_PCT" --argjson week_reset "$PROBE_WEEK_RESET" \
+    '{ts: $ts, pct: $pct, reset: $reset, week_pct: $week_pct, week_reset: $week_reset}' \
+    >"$PROBE_CACHE"
   return 0
 }
 
-# Rough token weighting: output and cache writes cost far more than cache reads.
-# Only meaningful when comparing iterations against each other.
-weighted_tokens() { # weighted_tokens <in> <out> <cache_read> <cache_create>
-  printf '%s' "$((($2 * 5) + $1 + ($4 * 5 / 4) + ($3 / 10)))"
-}
-
-# Our own consumption since <epoch>, as a percentage of the window. Only counts
-# what this ralph run spent, so it is a floor, never the whole picture - it is
-# what fills the gap when no server number is available. The pending argument
-# carries the iteration that has just finished but is not on the ledger yet.
-_ledger_pct_since() { # _ledger_pct_since <epoch> [pending-weighted]
-  local weighted="${2:-0}" logged=0
+# What we have spent since <epoch>, in micro-dollars. Cost is the only local
+# figure that survives a model switch: a sonnet iteration and an opus one can
+# move the same tokens and cost 4x apart. The pending argument carries the
+# iteration that has just finished but is not on the ledger yet.
+_ledger_cost_since() { # _ledger_cost_since <epoch> [pending-cost-u]
+  local cost="${2:-0}" logged=0
   if [[ -s "$LEDGER" ]]; then
     logged="$(jqf "0" -s -r --argjson from "$1" '
-        [ .[] | select((.ts // 0) >= $from) | .weighted // 0 ] | add // 0' "$LEDGER")"
+        [ .[] | select((.ts // 0) >= $from) | .cost_u // 0 ] | add | floor' "$LEDGER")"
     [[ "$logged" =~ ^[0-9]+$ ]] || logged=0
   fi
-  weighted=$((weighted + logged))
-  printf '%s' "$((weighted * 100 / (RALPH_WEIGHTED_BUDGET > 0 ? RALPH_WEIGHTED_BUDGET : 1)))"
-  ((weighted > 0))
+  printf '%s' "$((cost + logged))"
 }
 
-window_probe() { # window_probe [since-epoch] [pending-weighted-tokens]
-  local since="${1:-0}" pending="${2:-0}" cfg tsv now win_start add
-  local rl_reset="$RL_RESET" rl_pct="$RL_PCT" rl_status="$RL_STATUS"
+
+window_probe() { # window_probe [since-epoch] [pending-cost-u]
+  local since="${1:-0}" pending="${2:-0}" cfg tsv now win_start
+  local rl_reset="$RL_RESET" rl_pct="$RL_PCT"
   local cfg_pct=0 cfg_reset=0 cfg_week=0 cfg_week_reset=0 cfg_fetched=0
-  WIN_PCT=0 WIN_RESET=0 WEEK_PCT=0 WEEK_RESET=0 WIN_SRC="none" WIN_FRESH=1 WIN_FETCHED=0
+  WIN_PCT=0 WIN_RESET=0 WEEK_PCT=0 WEEK_RESET=0 WIN_SRC="none" WIN_FRESH=1 WIN_FETCHED=0 WIN_SPEND_U=0
 
   if ((DRY_RUN)); then
     _probe_fake
     return 0
   fi
   now="$(date +%s)"
+  _probe_headers || true
 
   # Stream data from a window that has already reset describes a window that no
   # longer exists. Waiting out a reset is exactly when this happens.
   if ((rl_reset > 0 && rl_reset <= now)); then
-    rl_reset=0 rl_pct=-1 rl_status=""
+    rl_reset=0 rl_pct=-1
   fi
 
   cfg="${CLAUDE_CONFIG_DIR:+$CLAUDE_CONFIG_DIR/.claude.json}"
@@ -1005,49 +1045,35 @@ window_probe() { # window_probe [since-epoch] [pending-weighted-tokens]
       IFS=$'\t' read -r cfg_pct cfg_reset cfg_week cfg_week_reset cfg_fetched <<<"$tsv"
   fi
 
-  # Whose reset to trust: the stream's is live, the config's is only as good as
-  # the reading it came with, and an expired one tells us nothing.
-  WIN_RESET="$rl_reset"
+  # Whose reset to trust: the probe's and the stream's are live, the config's is
+  # only as good as the reading it came with, and an expired one tells us nothing.
+  WIN_RESET="$PROBE_RESET"
+  ((WIN_RESET <= now)) && WIN_RESET="$rl_reset"
   ((WIN_RESET <= 0 && cfg_reset > now)) && WIN_RESET="$cfg_reset"
   ((WIN_RESET <= 0)) && WIN_RESET=$((now + WINDOW_S))
   win_start=$((WIN_RESET - WINDOW_S))
 
-  if ((rl_pct >= 0)); then
-    # The server's own number for this window. Nothing beats it.
-    WIN_PCT="$rl_pct" WIN_SRC="stream" WIN_FETCHED="$now"
-  elif ((cfg_fetched >= win_start && cfg_reset > now)); then
-    # A config reading taken inside the current window is usable as a floor; top
-    # it up with whatever we have spent since it was taken.
-    WIN_PCT="$cfg_pct" WIN_SRC="config" WIN_FETCHED="$cfg_fetched"
-    if add="$(_ledger_pct_since "$cfg_fetched" "$pending")"; then
-      WIN_PCT=$((WIN_PCT + add))
-      WIN_SRC="config+ledger"
-    fi
-    ((since > 0 && cfg_fetched < since)) && WIN_FRESH=0
-  else
-    # The config belongs to a window that has already ended. It is not a floor,
-    # not a ceiling, not stale data to bias from - it is void.
-    if ((RALPH_USE_CCUSAGE)) && _probe_ccusage; then
-      WIN_SRC="ccusage" WIN_FETCHED="$now"
-    elif add="$(_ledger_pct_since "$win_start" "$pending")"; then
-      WIN_PCT="$add" WIN_SRC="ledger" WIN_FETCHED="$now"
-    elif ((rl_reset > 0)); then
-      # No number anywhere, but the server did tell us where the window ends and
-      # that we are under the warning threshold.
-      WIN_PCT=0 WIN_SRC="stream" WIN_FETCHED="$now"
-    fi
-    ((cfg_fetched > 0)) && WIN_FRESH=0
-  fi
+  WIN_SPEND_U="$(_ledger_cost_since "$win_start" "$pending")"
 
-  # "allowed" means the server has not raised the warning yet, so we are below
-  # the threshold whatever any cache claims. A ceiling is not much, but it is
-  # enough to stop a dead reading from pausing a run that has barely started.
-  if [[ "$rl_status" == "allowed" ]] && ((WIN_PCT >= RALPH_WARN_PCT)); then
-    WIN_PCT=$((RALPH_WARN_PCT - 1))
+  # Every source here carries the server's own number - the only question is how
+  # old it is. Usage only climbs inside a window, so the highest reading that
+  # still belongs to this window is the closest one to the truth.
+  if ((PROBE_PCT >= 0)); then
+    WIN_PCT="$PROBE_PCT" WIN_SRC="api" WIN_FETCHED="$now"
+  fi
+  if ((rl_pct >= 0)) && { [[ "$WIN_SRC" == "none" ]] || ((rl_pct > WIN_PCT)); }; then
+    WIN_PCT="$rl_pct" WIN_SRC="stream" WIN_FETCHED="$now"
+  fi
+  if ((cfg_fetched >= win_start && cfg_reset > now)) &&
+    { [[ "$WIN_SRC" == "none" ]] || ((cfg_pct > WIN_PCT)); }; then
+    WIN_PCT="$cfg_pct" WIN_SRC="config" WIN_FETCHED="$cfg_fetched"
+    ((since > 0 && cfg_fetched < since)) && WIN_FRESH=0
   fi
   ((WIN_PCT > 100)) && WIN_PCT=100
 
-  if ((RL_WEEK_PCT >= 0)); then
+  if ((PROBE_WEEK_PCT >= 0)); then
+    WEEK_PCT="$PROBE_WEEK_PCT" WEEK_RESET="$PROBE_WEEK_RESET"
+  elif ((RL_WEEK_PCT >= 0)); then
     WEEK_PCT="$RL_WEEK_PCT"
     ((RL_WEEK_RESET > 0)) && WEEK_RESET="$RL_WEEK_RESET"
   elif ((cfg_week_reset > now)); then
@@ -1065,6 +1091,29 @@ window_line() { # "[####....]  41%   resets 14:50 (in 2h 51m)"
     "$(bar "$WIN_PCT")" "$C_GREY" "$(fmt_clock "$WIN_RESET")" "$(fmt_dur "$remain")" "$C_RESET"
 }
 
+# No percentage to show. Say so, and show what we do know: when the window ends
+# and what this run has put into it.
+window_unknown_line() {
+  local now remain out
+  now="$(date +%s)"
+  remain=$((WIN_RESET - now))
+  ((remain < 0)) && remain=0
+  out="${C_YELLOW}usage unknown${C_RESET}"
+  ((WIN_RESET > 0)) && out="$out   ${C_GREY}resets $(fmt_clock "$WIN_RESET") (in $(fmt_dur "$remain"))${C_RESET}"
+  ((WIN_SPEND_U > 0)) && out="$out   ${C_GREY}we have spent $(fmt_usd "$WIN_SPEND_U")${C_RESET}"
+  printf '%s' "$out"
+}
+
+WIN_HINT_SHOWN=0
+window_hint() {
+  ((WIN_HINT_SHOWN)) && return 0
+  WIN_HINT_SHOWN=1
+  warn "no rate-limit reading for this window"
+  ((RALPH_USAGE_PROBE)) ||
+    kv "hint" "RALPH_USAGE_PROBE=1 reads the real usage from the API rate-limit headers"
+  return 0
+}
+
 ledger_append() {
   mkdir -p "$RALPH_DIR"
   local target="$LEDGER"
@@ -1078,7 +1127,6 @@ ledger_append() {
     --argjson cost "${RES_COST_U:-0}" \
     --argjson tin "${RES_IN:-0}" --argjson tout "${RES_OUT:-0}" \
     --argjson cr "${RES_CR:-0}" --argjson cc "${RES_CC:-0}" \
-    --argjson weighted "$(weighted_tokens "${RES_IN:-0}" "${RES_OUT:-0}" "${RES_CR:-0}" "${RES_CC:-0}")" \
     --argjson pbefore "${WIN_PCT_BEFORE:-0}" --argjson pafter "${WIN_PCT:-0}" \
     --argjson pdelta "${WIN_DELTA:-0}" --argjson week "${WEEK_PCT:-0}" \
     --arg wsrc "$WIN_SRC" --arg commit "${ITER_COMMIT:-}" \
@@ -1087,7 +1135,6 @@ ledger_append() {
       model_req: $mreq, model_act: $mact, subtype: $subtype, class: $class,
       dur_s: $dur, turns: $turns, cost_u: $cost,
       in: $tin, out: $tout, cache_read: $cr, cache_create: $cc,
-      weighted: $weighted,
       pct_before: $pbefore, pct_after: $pafter, pct_delta: $pdelta,
       week_pct: $week, win_src: $wsrc, commit: $commit, passed: $passed}' >>"$target"
 }
@@ -1448,7 +1495,10 @@ iteration_summary() {
     local d=""
     ((WIN_DELTA != 0)) && d="   ${C_GREY}+${WIN_DELTA}% this iteration${C_RESET}"
     kv "5h window" "$(window_line)   ${C_GREY}via $WIN_SRC${C_RESET}$d"
-    ((WIN_FRESH)) || warn "no server reading for this window (config cache last refreshed $(fmt_clock "$WIN_FETCHED")) - $WIN_PCT% is our own spend only"
+    ((WIN_FRESH)) || warn "the newest reading available is from $(fmt_clock "$WIN_FETCHED"), before this iteration"
+  else
+    kv "5h window" "$(window_unknown_line)"
+    window_hint
   fi
 
   case "$ITER_CLASS" in
@@ -1506,7 +1556,7 @@ run_iteration() {
     # Refresh the window. The ledger row for this iteration is written further
     # down, so hand the probe its cost to fold in.
     window_probe "$start" \
-      "$(weighted_tokens "${RES_IN:-0}" "${RES_OUT:-0}" "${RES_CR:-0}" "${RES_CC:-0}")"
+      "${RES_COST_U:-0}"
     if ((WIN_PCT >= WIN_PCT_BEFORE)); then
       WIN_DELTA=$((WIN_PCT - WIN_PCT_BEFORE))
     else
@@ -1623,10 +1673,12 @@ run_header() {
   kv "stories" "$(bar "$spct" 28 "$C_GREEN")   ${C_GREY}$PRD_PASSING/$PRD_TOTAL${C_RESET}"
   if [[ "$WIN_SRC" != "none" ]]; then
     kv "5h window" "$(window_line)"
-    kv "7d window" "$(bar "$WEEK_PCT")   ${C_GREY}resets $(fmt_clock "$WEEK_RESET")${C_RESET}"
   else
-    warn "no rate-limit data available - pacing will report only"
+    kv "5h window" "$(window_unknown_line)"
+    window_hint
   fi
+  ((WEEK_RESET > 0)) &&
+    kv "7d window" "$(bar "$WEEK_PCT")   ${C_GREY}resets $(fmt_clock "$WEEK_RESET")${C_RESET}"
   return 0
 }
 
@@ -1711,9 +1763,14 @@ explain() {
   hr "window"
   window_probe
   kv "source" "$WIN_SRC"
-  kv "5h" "$(window_line)"
+  if [[ "$WIN_SRC" != "none" ]]; then
+    kv "5h" "$(window_line)"
+    kv "fetched" "$(fmt_clock "$WIN_FETCHED")"
+  else
+    kv "5h" "$(window_unknown_line)"
+    window_hint
+  fi
   kv "7d" "$(bar "$WEEK_PCT")   ${C_GREY}resets $(fmt_clock "$WEEK_RESET")${C_RESET}"
-  kv "fetched" "$(fmt_clock "$WIN_FETCHED")"
   printf '\n'
   hr "pace decision"
   pace_decide

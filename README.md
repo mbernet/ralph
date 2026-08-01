@@ -189,25 +189,34 @@ you want `max` because a story is *big*, split the story instead.
 After every iteration Ralph reads how much of your rate-limit window you have burned and
 decides what to do, so a long run does not exhaust your limit unattended.
 
-Sources, in order:
-1. The `rate_limit_event` records in the agent's own output stream. They come straight
-   from the server - `utilization`, `resetsAt` and `rateLimitType` - so they are live,
-   account-wide (every project and session you have open counts) and free: no extra call.
-   The catch is that `utilization` only rides along once you pass the warning threshold
-   (`RALPH_WARN_PCT`, 90%). Below it the status is a plain `allowed`, which is not a
-   number but is still a ceiling - and a ceiling is enough to veto a stale reading.
-2. `~/.claude.json` → `cachedUsageUtilization`, the numbers the Claude Code CLI caches
-   from its `anthropic-ratelimit-unified-*` response headers. Used **only** when its
-   `fetchedAtMs` falls inside the window that is currently open; some CLI builds leave
-   this cache frozen for days, and a reading from a window that has already reset is not
-   a floor, a ceiling or stale data to bias from - it is void. When it is usable, Ralph
-   tops it up with its own spend since it was taken.
-3. `ccusage blocks --active --json`, if you opt in with `RALPH_USE_CCUSAGE=1`.
-4. `.ralph/usage.jsonl` - Ralph's own ledger, summed over the open window. This one only
-   sees what Ralph itself spent, so it is a floor, never the whole picture. Last resort.
+Every number below is the server's own; the only difference between the sources is how
+old it is. Usage only climbs inside a window, so Ralph takes the highest reading that
+still belongs to the window that is open.
 
-The source in play is printed after every iteration (`via stream`, `via config+ledger`…),
-and a run with no server reading at all says so rather than pacing on a guess.
+1. **The API rate-limit headers.** `anthropic-ratelimit-unified-5h-utilization` and its
+   `-reset` / `7d` siblings come back with *every* API response. Ralph asks for them
+   directly: one `claude-haiku` call capped at a single output token, for the headers
+   that ride along with it. It costs roughly a hundredth of a cent and a second, and it
+   is the only way to know you are at 14% rather than at 83% - see below for why nothing
+   else can tell you that. The reading is cached for `RALPH_PROBE_TTL_S` (60s) so the
+   several probes inside one iteration make one call. `RALPH_USAGE_PROBE=0` turns it off.
+   The token comes from the macOS keychain (`Claude Code-credentials`),
+   `~/.claude/.credentials.json`, or `ANTHROPIC_API_KEY`.
+2. The `rate_limit_event` records in the agent's own output stream - free, no extra call,
+   and newer than anything cached. The catch is that `utilization` only rides along once
+   you pass the warning threshold (`RALPH_WARN_PCT`, 90%): below it the record carries a
+   plain `allowed` and a `resetsAt`, and no number at all.
+3. `~/.claude.json` → `cachedUsageUtilization`, where the CLI caches those same headers.
+   Used **only** when its `fetchedAtMs` falls inside the window that is currently open:
+   some CLI builds leave this cache frozen for days, and a reading from a window that has
+   already reset is not a floor, a ceiling or stale data to bias from - it is void.
+
+With none of them available Ralph says `usage unknown`, shows the reset and what this run
+has spent, and paces on nothing. It does not fill the gap with its own token ledger: that
+sees one project, is blind to the model in play and needs a per-plan budget constant to
+mean anything - it once read 83% against a real 10% and held a run for hours.
+
+The source in play is printed after every iteration (`via api`, `via stream`…).
 
 Four possible actions:
 
@@ -232,8 +241,10 @@ an iteration** (`RALPH_MAX_RETRIES`, default 3), backing off to the window reset
 | `RALPH_MIN_DELAY_S` | `5` | breather between iterations |
 | `RALPH_MAX_RETRIES` | `3` | rate-limit retries per story |
 | `RALPH_ITER_BUDGET_USD` | unset | per-iteration `--max-budget-usd` |
-| `RALPH_USE_CCUSAGE` | `0` | also probe `ccusage blocks` |
 | `RALPH_WARN_PCT` | `90` | where the server starts warning |
+| `RALPH_USAGE_PROBE` | `1` | read the real usage from the API headers |
+| `RALPH_PROBE_MODEL` | haiku | model for that probe |
+| `RALPH_PROBE_TTL_S` | `60` | how long a probe reading is reused |
 
 Costs shown are the API-equivalent price the CLI reports. On a subscription that is
 informational, not what you are billed - the percentages are what matter.
