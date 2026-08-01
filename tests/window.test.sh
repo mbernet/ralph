@@ -20,6 +20,10 @@ export RALPH_DIR="$TMP/ralph"
 export CLAUDE_CONFIG_DIR="$TMP/cfg"
 mkdir -p "$RALPH_DIR" "$CLAUDE_CONFIG_DIR"
 
+# The probe reads live rate-limit headers. Point it at a closed port so a cache
+# miss fails at once instead of billing a token and asserting against real usage.
+export RALPH_API_BASE="http://127.0.0.1:1"
+
 # shellcheck source=/dev/null
 source "$TEST_DIR/../ralph.sh"
 ui_init
@@ -58,6 +62,15 @@ config() { # config <fetched-epoch> <5h pct> <5h reset> <7d pct> <7d reset>
   "five_hour":{"utilization":$2,"resets_at":"$(date -u -r "$3" +%Y-%m-%dT%H:%M:%S.000000+00:00)"},
   "seven_day":{"utilization":$4,"resets_at":"$(date -u -r "$5" +%Y-%m-%dT%H:%M:%S.000000+00:00)"}}}}
 EOF
+}
+
+# One ledger line per iteration, with only the fields the probe reads.
+ledger() { # ledger <ts> <cost-usd>...  (pairs)
+  : >"$LEDGER"
+  while (($# >= 2)); do
+    jq -nc --argjson ts "$1" --argjson c "$(($2 * 1000000))" '{ts: $ts, cost_u: $c}' >>"$LEDGER"
+    shift 2
+  done
 }
 
 printf '\nratelimit_event_parse\n'
@@ -122,6 +135,49 @@ window_probe "$NOW"
 check "a rolled-over window starts from zero" "0" "$WIN_PCT"
 check "the expired reset is not reused" "1" "$((WIN_RESET > NOW))"
 
+printf '\napi probe\n'
+
+# The probe is the whole point: below the warning threshold the stream carries no
+# number at all, so this is the only way to know we are at 14% and not at 83%.
+probe() { # probe <ts> <5h pct> <5h reset> <7d pct> <7d reset>
+  jq -nc --argjson ts "$1" --argjson pct "$2" --argjson reset "$3" \
+    --argjson wp "$4" --argjson wr "$5" \
+    '{ts: $ts, pct: $pct, reset: $reset, week_pct: $wp, week_reset: $wr}' >"$PROBE_CACHE"
+}
+
+config $((NOW - 172800)) 4 $((NOW - 170000)) 22 $((NOW + 400000))
+stream "$TMP/s11.jsonl" "$(ev five_hour allowed $((NOW + 14400)))"
+ratelimit_event_parse "$TMP/s11.jsonl"
+probe "$NOW" 14 $((NOW + 14400)) 29 $((NOW + 400000))
+window_probe "$NOW"
+check "the probe reading is used" "14" "$WIN_PCT"
+check "source is the api" "api" "$WIN_SRC"
+check "the probe carries the 7d window too" "29" "$WEEK_PCT"
+check "and its reset" "$((NOW + 14400))" "$WIN_RESET"
+
+# A stream warning is newer than a cached probe reading, and usage only climbs.
+stream "$TMP/s12.jsonl" "$(ev five_hour allowed_warning $((NOW + 14400)) 0.93)"
+ratelimit_event_parse "$TMP/s12.jsonl"
+window_probe "$NOW"
+check "a higher stream reading wins" "93" "$WIN_PCT"
+check "source is the stream" "stream" "$WIN_SRC"
+
+# A reading older than RALPH_PROBE_TTL_S is not reused: _probe_headers refetches.
+probe $((NOW - 3600)) 14 $((NOW + 14400)) 29 $((NOW + 400000))
+RALPH_USAGE_PROBE=0
+ratelimit_event_parse "$TMP/s11.jsonl"
+window_probe "$NOW"
+check "a stale cache is not read" "none" "$WIN_SRC"
+RALPH_USAGE_PROBE=1
+
+# Turning the probe off leaves the old sources in place, warts and all.
+probe "$NOW" 14 $((NOW + 14400)) 29 $((NOW + 400000))
+RALPH_USAGE_PROBE=0
+window_probe "$NOW"
+check "the probe can be turned off" "none" "$WIN_SRC"
+RALPH_USAGE_PROBE=1
+: >"$PROBE_CACHE"
+
 printf '\npace_decide\n'
 
 # The morning false positive, end to end: ralph paused a run that had barely
@@ -141,6 +197,22 @@ ratelimit_event_parse "$TMP/s10.jsonl"
 window_probe "$NOW"
 pace_decide
 check "holds at a real 93%" "wait_window" "$PACE_ACTION"
+
+# The regression: a dead config and a server that only says "allowed". ralph used
+# to fill the gap with its own spend against an invented budget, read 83%, and
+# hold the run. The probe says 14%.
+config $((NOW - 172800)) 4 $((NOW - 170000)) 22 $((NOW + 400000))
+stream "$TMP/s13.jsonl" "$(ev five_hour allowed $((NOW + 14400)))"
+ratelimit_event_parse "$TMP/s13.jsonl"
+ledger $((NOW - 1800)) 13 $((NOW - 600)) 3
+probe "$NOW" 14 $((NOW + 14400)) 29 $((NOW + 400000))
+window_probe "$NOW"
+check "the real reading, not our spend" "14" "$WIN_PCT"
+pace_decide
+check "and no pause" "go" "$PACE_ACTION"
+check "our spend is still reported" "16000000" "$WIN_SPEND_U"
+ledger
+: >"$PROBE_CACHE"
 
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAIL"
 ((FAIL == 0))
