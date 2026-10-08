@@ -386,7 +386,7 @@ close - `replay.sh` is the place to start: it shows the server's own reading nex
 percentage that run recorded at the time. The two drifting apart means Ralph was pacing
 on a source that had gone cold.
 
-Run the test suite with `./tests/window.test.sh`.
+Run the test suites with `./tests/window.test.sh` and `./tests/archive.test.sh`.
 
 ## Customizing the Prompt
 
@@ -397,7 +397,7 @@ After copying `prompt.md` (for Amp) or `CLAUDE.md` (for Claude Code) to your pro
 
 ## Archiving
 
-Ralph automatically archives previous runs when you start a new feature (different `branchName`). Archives are saved to `archive/YYYY-MM-DD-feature-name/`.
+Ralph automatically archives previous runs when you start a new feature (different `branchName`). Archives are saved to `archive/YYYY-MM-DD-feature-name/`. The new `progress.txt` starts empty except for the `## Codebase Patterns` section, which carries over: it is knowledge about the project, not about the run.
 
 ## References
 
