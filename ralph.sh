@@ -529,10 +529,27 @@ archive_if_branch_changed() {
   [[ -f "$PROGRESS_FILE" ]] && cp "$PROGRESS_FILE" "$dest/"
   kv "archived" "$dest"
 
+  # The Codebase Patterns section survives the reset. It is knowledge about the
+  # project, not about the run that ends, and every iteration is told to read it
+  # first: without it the first story of a new run starts blind.
+  local patterns=""
+  if [[ -f "$PROGRESS_FILE" ]]; then
+    patterns="$(awk '
+      /^## Codebase Patterns/ { inblock = 1; print; next }
+      inblock && /^## / { inblock = 0 }
+      inblock && !/^---$/ { print }
+    ' "$PROGRESS_FILE")"
+  fi
+
   {
     echo "# Ralph Progress Log"
     echo "Started: $(date)"
     echo "---"
+    if [[ -n "$patterns" ]]; then
+      echo ""
+      echo "$patterns"
+      echo "---"
+    fi
   } >"$PROGRESS_FILE"
 }
 
