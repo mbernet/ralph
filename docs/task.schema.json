@@ -1,0 +1,163 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "task.schema.json",
+  "title": "Task",
+  "$comment": "Stage names are free: each project defines its own pipeline. The server checks that state.stage is a pipeline stage or 'done', that runs[].stage is a pipeline stage or 'doctor', and applies the position-based rules (first stage carries pr and assumptions and cannot reject; last stage sets summary). None of that is expressible here.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "spec", "state", "runs"],
+  "properties": {
+    "id": { "$ref": "#/$defs/taskId" },
+    "spec": { "$ref": "#/$defs/spec" },
+    "state": { "$ref": "#/$defs/state" },
+    "runs": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/run" }
+    }
+  },
+  "allOf": [
+    {
+      "$comment": "A task with no runs has no PR.",
+      "if": { "properties": { "runs": { "maxItems": 0 } } },
+      "then": { "properties": { "state": { "properties": { "pr": { "type": "null" } } } } }
+    }
+  ],
+  "$defs": {
+    "taskId": {
+      "type": "string",
+      "pattern": "^US-[0-9]{3,}$"
+    },
+    "ulid": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+    },
+    "workerId": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,62}$"
+    },
+    "stageName": {
+      "$comment": "A pipeline stage name as declared by the project. 'done' and 'doctor' are reserved by the server.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,30}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "Z$"
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "description", "acceptanceCriteria", "priority", "model", "dependsOn"],
+      "properties": {
+        "title": { "$ref": "#/$defs/text" },
+        "description": { "$ref": "#/$defs/text" },
+        "acceptanceCriteria": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/text" }
+        },
+        "priority": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 5
+        },
+        "model": {
+          "enum": ["low", "med", "high"]
+        },
+        "dependsOn": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/taskId" }
+        }
+      }
+    },
+    "state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stage", "pr", "sick", "claim", "summary"],
+      "properties": {
+        "stage": {
+          "$comment": "A pipeline stage of the project, or 'done'.",
+          "$ref": "#/$defs/stageName"
+        },
+        "pr": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "string", "pattern": "^https://github\\.com/[^/]+/[^/]+/pull/[0-9]+$" }
+          ]
+        },
+        "sick": { "type": "boolean" },
+        "claim": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/claim" }
+          ]
+        },
+        "summary": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/text" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "$comment": "Done: closed, healthy, summarised, with a PR.",
+          "if": { "properties": { "stage": { "const": "done" } } },
+          "then": {
+            "properties": {
+              "claim": { "type": "null" },
+              "sick": { "const": false },
+              "summary": { "type": "string" },
+              "pr": { "type": "string" }
+            }
+          },
+          "else": {
+            "properties": {
+              "summary": { "type": "null" }
+            }
+          }
+        }
+      ]
+    },
+    "claim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "worker", "expiresAt"],
+      "properties": {
+        "id": { "$ref": "#/$defs/ulid" },
+        "worker": { "$ref": "#/$defs/workerId" },
+        "expiresAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "stage", "worker", "outcome", "endedAt", "body", "assumptions"],
+      "properties": {
+        "id": { "$ref": "#/$defs/ulid" },
+        "stage": {
+          "$comment": "A pipeline stage of the project, or 'doctor'.",
+          "$ref": "#/$defs/stageName"
+        },
+        "worker": { "$ref": "#/$defs/workerId" },
+        "outcome": {
+          "enum": ["pass", "reject", "sick"]
+        },
+        "endedAt": { "$ref": "#/$defs/timestamp" },
+        "body": { "$ref": "#/$defs/text" },
+        "assumptions": {
+          "$comment": "Only runs of the first pipeline stage carry assumptions; enforced by the server.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/text" }
+        }
+      }
+    }
+  }
+}

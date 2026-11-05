@@ -1,532 +1,421 @@
-# Spec: PRD centralizado para varios workers de Ralph
+# Spec: API central de tareas para Ralph
 
-Estado: definida · 2026-11-04
+Estado: borrador · 2026-11-04 · Schema de tarea: [`task.schema.json`](task.schema.json)
+
+## 0. Qué es un Ralph loop
+
+Un Ralph loop es un script (`ralph.sh`) que lanza un agente de código una y otra vez hasta terminar un PRD. El PRD es un `prd.json` con una lista de user stories: cada una tiene título, descripción, criterios de aceptación, prioridad y un flag `passes`. Cada iteración arranca un agente nuevo, con contexto limpio, que lee el PRD, coge la historia pendiente de mayor prioridad, la implementa, pasa los checks del proyecto, hace commit, marca `passes: true` y escribe lo aprendido en `progress.txt`. El agente no recuerda nada entre iteraciones: su única memoria es git, el `prd.json` y el `progress.txt`. El bucle acaba cuando todas las historias pasan.
+
+El patrón es de [Geoffrey Huntley](https://ghuntley.com/ralph/). Funciona porque cada historia es pequeña y el agente empieza cada vez sin el ruido de la anterior. Su límite es que todo vive en ficheros locales de un único checkout: un solo worker, sin revisión y sin PR.
+
+Esta spec sustituye esos ficheros por una API. Las historias pasan a llamarse tareas, `passes` se convierte en un pipeline de etapas y `progress.txt` en los resúmenes de las tareas terminadas.
 
 ## 1. Objetivo
 
-Sustituir el `prd.json` local por una API que comparten varios workers de Ralph sobre el mismo proyecto. Cada historia pasa por un pipeline de etapas (implementar, revisar spec, revisar código) y avanza mediante PR igual que en un equipo humano. Un worker coge una historia, la lleva por todas las etapas y, cuando la última revisión aprueba, mergea el PR. Cada etapa es una ejecución nueva del agente, con contexto limpio y el prompt de esa etapa.
+Sustituir el `prd.json` local por una API que comparten varios workers de Ralph sobre el mismo proyecto. Cada tarea pasa por un pipeline de etapas y acaba mergeada en `main` mediante PR, sin intervención humana salvo en casos graves.
 
-Las historias nunca se paran a esperar a una persona. Cuando algo requiere una decisión humana, el agente hace una asunción, la declara y sigue. Las asunciones quedan pendientes de revisión, y una persona las revisa cuando puede.
-
-La API solo guarda estado y aplica las reglas de transición. No sabe nada de git, de prompts ni de modelos.
+Principio rector: máxima autonomía con el diseño más simple posible. La API guarda tareas, reparte trabajo y aplica las transiciones. No sabe nada de git, de prompts ni de modelos. Todo el contexto que necesita un agente vive en el JSON de la tarea; el PR no lleva nada que la API no tenga.
 
 ### Fuera de alcance
 
-- Usuarios, roles y permisos (hay un único token compartido).
-- Notificaciones y webhooks. Las historias con asunciones sin revisar se consultan con `GET /stories?needsReview=true`.
-- Borrar historias.
-- Editar historias que ya han empezado (ver 5.5).
-- Etapas en paralelo: el pipeline es estrictamente secuencial.
-- Workers especializados: todos los workers pueden hacer todas las etapas y tienen permisos para mergear en GitHub.
+- Usuarios, roles y permisos. Un único token por despliegue.
+- Notificaciones y webhooks.
+- Borrar proyectos o tareas.
+- Etapas en paralelo. El pipeline es una lista ordenada y cada tarea está en una sola etapa.
+- Workers especializados. Todo worker puede ejecutar cualquier etapa.
 
 ## 2. Conceptos
 
 | Concepto | Qué es |
 |---|---|
-| Proyecto | Un PRD: su pipeline y sus historias. |
-| Pipeline | Lista ordenada de etapas por las que pasa cada historia. La primera es la de implementación. |
-| Historia | Una user story del PRD. |
-| Estado (`status`) | En qué punto de su ciclo de vida está una historia: `pending`, `in_progress` o `completed`. |
-| Etapa (`stage`) | En qué etapa del pipeline está una historia. Indica qué prompt y qué modelo usa la siguiente ejecución. |
-| Worker | Un proceso `ralph.sh` que coge una historia y la lleva por todas las etapas. Se identifica con un nombre libre, por ejemplo `mac-marc-4123`. |
-| Claim | Reserva de una historia por parte de un worker mientras la lleva por el pipeline. Se renueva con cada run y caduca si el worker deja de registrarlos. |
-| Run | Resultado de una ejecución de un worker sobre una historia. Los runs son el historial de la historia y nunca se modifican. |
-| Asunción | Decisión que el agente ha tomado sin poder confirmarla y que una persona debería revisar. No detiene la historia. |
+| Proyecto | Un PRD: su descripción, su pipeline y sus tareas. |
+| Pipeline | Lista ordenada de etapas que define cada proyecto. El servidor no sabe qué hace cada una; solo distingue la primera, las intermedias y la última. |
+| Tarea | Una user story. Tres partes: `spec` (la escribe una persona), `state` (mínimo estado mutable) y `runs` (historial de solo añadir). |
+| Etapa (`stage`) | En qué etapa del pipeline está la tarea, o `done` cuando ha salido por el final. |
+| Worker | Un proceso `ralph.sh` con un checkout del repo. Se identifica con un nombre estable, por ejemplo `mac-marc`. |
+| Claim | Reserva de una tarea por un worker para ejecutar **una** etapa. Caduca sola; no se libera a mano. Su `id` evita que un worker colgado escriba encima de otro. |
+| Run | Resultado de una ejecución de un agente sobre una tarea. Inmutable. |
+| Sick | Marca de que la tarea no avanza por medios normales. La siguiente ejecución la hace el agente `doctor`. |
+| Doctor | Etapa de run, no de pipeline. Diagnostica una tarea `sick` y la devuelve al circuito o la deja para una persona. |
 
-## 3. Convenciones de la API
+Lo que el servidor exige a un pipeline es poco: la primera etapa produce el PR y declara asunciones; las demás pueden rechazar y devolver la tarea a la primera; la última, al aprobar, cierra la tarea con un resumen. Todo lo demás es cosa de los prompts del proyecto, no de la API.
 
-- Base: `/api`. JSON en peticiones y respuestas, salvo `/progress` (`text/markdown`).
-- Campos en `camelCase`.
-- Fechas en ISO 8601 UTC: `2026-11-04T10:12:00Z`.
-- Auth: cabecera `Authorization: Bearer <token>`, comparado con un token de configuración. Sin token o con uno incorrecto: `401`.
-- Errores:
+Los ejemplos de esta spec usan el pipeline `implement` → `review_functional` → `review_code` → `merge`: implementar; comprobar que el PR cumple los criterios de aceptación; revisar la calidad del código; actualizar la rama, esperar al CI, mergear y escribir el resumen. Un proyecto pequeño puede quedarse en `implement` → `review`, y otro añadir `qa_manual` o `security` donde le convenga.
 
-```json
-{ "message": "Texto legible", "errors": { "campo": ["motivo"] } }
-```
+## 3. Convenciones
 
-`errors` solo aparece en los `422`.
+- Base: `/api`. JSON en peticiones y respuestas, salvo el panel (9).
+- Campos en `camelCase`. Fechas ISO 8601 en UTC con sufijo `Z`. Ids de claims y runs en ULID.
+- Auth: `Authorization: Bearer <token>`. Sin token o incorrecto: `401`. El panel usa el mismo token; cómo lo pide al navegador se decide al implementarlo.
+- Errores: `{ "error": "texto legible" }`.
 
 | Código | Cuándo |
 |---|---|
 | `200` | Lectura o modificación correcta. |
-| `201` | Recurso creado. Incluye cabecera `Location`. |
-| `204` | Borrado correcto. |
+| `201` | Recurso creado. |
 | `401` | Token ausente o incorrecto. |
-| `404` | El proyecto, la historia, el claim o la asunción no existen. |
-| `409` | La petición es válida pero el estado actual no la permite. |
-| `422` | Body inválido. |
+| `404` | Proyecto o tarea inexistente. |
+| `409` | Petición válida pero el estado actual no la permite. |
+| `422` | Body inválido contra el schema o las reglas de validación. |
 
-## 4. Modelo
+## 4. Recursos
 
 ### 4.1 Proyecto
 
 ```json
 {
-  "id": "01JC8Z...",
-  "name": "MyApp",
-  "description": "Task Priority System",
-  "pipeline": ["implement", "review-spec", "review-code"],
-  "maxRejections": 3,
-  "claimTtlMinutes": 120,
-  "counts": {
-    "total": 5,
-    "claimed": 2,
-    "needsReview": 1,
-    "byStatus": { "pending": 1, "in_progress": 3, "completed": 1 },
-    "byStage": { "implement": 2, "review-spec": 1, "review-code": 1 }
-  },
-  "createdAt": "2026-11-04T09:00:00Z"
+  "id": "myapp",
+  "description": "Task Priority System - Add priority levels to tasks",
+  "pipeline": ["implement", "review_functional", "review_code", "merge"],
+  "counts": { "total": 5, "done": 1, "claimed": 2, "sick": 0, "needsHuman": 0, "blocked": 0 }
 }
 ```
 
-- `id`: lo genera el servidor.
-- `pipeline`: al menos una etapa. Nombres únicos con el formato `^[a-z0-9-]+$`. El merge no es una etapa: lo hace el worker (7.4).
-- `maxRejections`: cuántas veces puede volver una historia a la primera etapa por un rechazo. Entero ≥ 0. Por defecto, `3`. Ver 5.2.
-- `claimTtlMinutes`: entero ≥ 1. Por defecto, `120`. Tiene que cubrir la etapa más larga, más la espera al CI en la última etapa (7.4).
-- `counts`: calculado y solo de lectura. `byStage` cuenta solo las historias `pending` e `in_progress`. `needsReview` cuenta historias con alguna asunción sin revisar.
+- `id`: slug, `^[a-z0-9][a-z0-9-]{0,62}$`. Lo elige quien crea el proyecto.
+- `description`: contexto del PRD que recibe cada agente.
+- `pipeline`: al menos una etapa. Nombres únicos con el formato `^[a-z][a-z0-9_]{0,30}$`; `done` y `doctor` están reservados. El worker necesita un prompt por cada nombre (7).
+- `counts`: calculado. `needsHuman` cuenta las tareas paradas a la espera de una persona (5.3). `blocked` cuenta esas más todas las que dependen de ellas, directa o transitivamente: ninguna avanzará sin intervención humana.
 
-### 4.2 Historia
+### 4.2 Tarea
+
+Es exactamente el documento de `task.schema.json`. El schema no conoce el pipeline: `state.stage` y `runs[].stage` son nombres libres y el servidor valida que existan en el proyecto (más `done` y `doctor`). Las reglas que dependen de la posición de la etapa (5.2) también las aplica el servidor, no el schema.
 
 ```json
 {
   "id": "US-002",
-  "title": "Display priority indicator on task cards",
-  "description": "As a user, I want to see task priority at a glance.",
-  "acceptanceCriteria": ["Each task card shows colored priority badge", "Typecheck passes"],
-  "priority": 2,
-  "model": "med",
-  "notes": "",
-  "dependsOn": ["US-001"],
-  "status": "in_progress",
-  "stage": "review-code",
-  "pr": "https://github.com/mbernet/myapp/pull/12",
-  "rejections": 1,
-  "needsReview": true,
-  "claim": { "id": "01JC9A...", "worker": "vps-1-881", "expiresAt": "2026-11-04T12:30:00Z" },
-  "completedAt": null,
-  "assumptions": [],
-  "runs": []
-}
-```
-
-- `id`: la clave del PRD (`US-002`). Única dentro del proyecto. Es la que se usa en las URL.
-- `model`: opcional. Si existe, prevalece sobre el modelo del prompt de la etapa (ver 7.2).
-- `status`: estado de la historia (ver 4.3).
-- `stage`: etapa actual del pipeline. Al crear, la primera. En `completed`, `null`.
-- `pr`: `null` hasta que un run lo informa.
-- `rejections`: número de veces que la historia ha vuelto a la primera etapa por un `changes_requested`.
-- `needsReview`: calculado. `true` si alguna asunción no está revisada.
-- `claim`: el claim activo o `null`. Un claim caducado se muestra como `null`.
-- `completedAt`: la fecha del run que dejó la historia en `completed`, o `null`.
-- `assumptions` y `runs`: ordenados por fecha. Solo se incluyen en el detalle de la historia y en la respuesta del claim, no en el listado.
-
-### 4.3 Estados
-
-| `status` | Significado | `stage` |
-|---|---|---|
-| `pending` | No ha empezado: no tiene ningún run. | La primera del pipeline. |
-| `in_progress` | Ha empezado y aún no ha terminado. | La actual. |
-| `completed` | Ha pasado todas las etapas: el PR está mergeado. | `null`. |
-
-Cada campo responde a una pregunta distinta. `status` dice en qué punto de su ciclo de vida está la historia; `stage`, qué etapa le toca ejecutar; `claim`, qué worker la lleva; `needsReview`, si una persona tiene algo que revisar. Una historia puede estar `completed` y tener `needsReview: true`.
-
-### 4.4 Run
-
-```json
-{
-  "id": "01JC9F...",
-  "stage": "review-code",
-  "worker": "vps-1-881",
-  "result": "changes_requested",
-  "body": "Falta el test del filtro vacío.",
-  "createdAt": "2026-11-04T11:02:00Z"
-}
-```
-
-Valores de `result`:
-
-| `result` | Etapa | Efecto |
-|---|---|---|
-| `done` | Primera etapa | Avanza. |
-| `approved` | Cualquier etapa menos la primera | Avanza. |
-| `changes_requested` | Cualquier etapa menos la primera | Vuelve a la primera etapa, salvo que se haya alcanzado el límite (5.2). |
-| `merge_failed` | Solo la última etapa | Vuelve a la primera etapa sin contar como rechazo. Lo registra el worker, no el agente (7.4). |
-
-`body` es markdown libre. En la primera etapa es el informe de progreso, con el formato actual de `progress.txt`. En las revisiones es el feedback. En `merge_failed`, el motivo del fallo: ficheros en conflicto o checks del CI que han fallado.
-
-### 4.5 Asunción
-
-```json
-{
-  "id": "01JCA2...",
-  "runId": "01JC9F...",
-  "stage": "implement",
-  "text": "No está claro si el filtro debe persistir entre sesiones. He asumido que no.",
-  "reviewed": false,
-  "reviewedAt": null,
-  "createdAt": "2026-11-04T10:12:00Z"
-}
-```
-
-- La crea el servidor a partir de un run (6.9) o al forzar un avance por límite de rechazos (5.2).
-- `text` es lo único que escribe el agente. Debe decir qué no estaba claro y qué ha decidido.
-- `reviewed` solo lo cambia una persona (6.10).
-
-### 4.6 Claim
-
-```json
-{
-  "id": "01JC9A...",
-  "worker": "vps-1-881",
-  "expiresAt": "2026-11-04T12:30:00Z",
-  "story": { "...": "historia completa, con runs y asunciones" }
-}
-```
-
-- El claim es de la historia, no de una etapa: dura todo el pipeline.
-- Una historia tiene como mucho un claim. Un claim nuevo sustituye al anterior caducado.
-- Un claim está activo mientras `expiresAt > now`. `expiresAt` es la hora del último run (o de la creación) más `claimTtlMinutes`. Por eso el TTL solo tiene que cubrir la etapa más larga.
-- Si un worker muere, el claim caduca y otro worker retoma la historia en la etapa en la que estaba.
-
-## 5. Reglas
-
-### 5.1 Elegibilidad para un claim
-
-Una historia se puede asignar a un worker si se cumplen las tres condiciones:
-
-1. `status` es `pending` o `in_progress`.
-2. No tiene claim activo.
-3. Todas las historias de `dependsOn` están `completed`, es decir, con el PR mergeado. Que tengan asunciones sin revisar no importa.
-
-Entre las elegibles, el orden es:
-
-1. Primero las `in_progress`: son historias abandonadas, cuyo claim caducó. Así se termina lo empezado antes de abrir trabajo nuevo.
-2. Después las `pending`.
-3. Dentro de cada grupo, la de menor `priority` y, si hay empate, la de menor `id`.
-
-La elección y la creación del claim son atómicas: dos peticiones simultáneas nunca obtienen la misma historia.
-
-### 5.2 Transiciones
-
-Siendo `P` el pipeline y `P[0]` la primera etapa:
-
-| Situación | Run | Resultado |
-|---|---|---|
-| En `P[i]`, sin ser la última | `done` / `approved` | `in_progress`, en `P[i+1]`. |
-| En la última etapa | `done` / `approved` | `completed`, `stage` a `null` y se fija `completedAt`. El worker solo lo registra después de mergear (7.4). |
-| En `P[i]` con `i > 0`, y `rejections < maxRejections` | `changes_requested` | `rejections + 1`. `in_progress`, en `P[0]`. |
-| En `P[i]` con `i > 0`, y `rejections == maxRejections` | `changes_requested` | Avance forzado: se trata como `approved` y se crea una asunción. |
-| En la última etapa | `merge_failed` | `in_progress`, en `P[0]`. `rejections` no cambia. |
-
-Una historia `pending` pasa a `in_progress` con su primer run. Si el pipeline tiene una sola etapa, ese run es `done` y la historia pasa directamente a `completed`.
-
-**Avance forzado.** Cuando se alcanza el límite, la historia no se para. El run se guarda tal cual, con `result: "changes_requested"`, para que el historial sea fiel. La historia avanza como si se hubiera aprobado, y el servidor crea una asunción con el texto `"Avanza sin aprobar en {stage} por límite de rechazos ({maxRejections}): {body}"`. Así la persona que revise ve exactamente qué no convencía al revisor. Con `maxRejections: 3`, la historia puede volver a implementarse tres veces; el cuarto rechazo ya no la devuelve.
-
-Si el avance forzado ocurre en la última etapa, el servidor responde con la historia todavía `in_progress` en esa etapa y con `forcedApproval: true` en la respuesta del run. El worker mergea (7.4) y registra después el run `approved`. Así una historia nunca pasa a `completed` sin que su PR esté mergeado.
-
-Al registrar un run:
-
-- Si la historia sigue `pending` o `in_progress`, el claim se renueva (`expiresAt` = ahora + `claimTtlMinutes`) y el mismo worker continúa con la siguiente etapa.
-- Si pasa a `completed`, el claim se borra.
-
-### 5.3 Asunciones
-
-- Cualquier run, de cualquier etapa, puede declarar asunciones. No cambian la transición.
-- Las asunciones no bloquean nada: ni el avance de la historia, ni el merge, ni las historias que dependen de ella.
-- Una persona revisa las historias con `needsReview: true` y marca cada asunción como revisada. Si la asunción era incorrecta y la historia ya está `completed`, la corrección se hace creando una historia nueva.
-- Los agentes de las etapas siguientes reciben las asunciones de la historia en `{{assumptions}}` (7.2). Un revisor puede así darlas por buenas o pedir cambios.
-
-### 5.4 Validación de historias
-
-Se aplica al crear el proyecto, al añadir una historia y al editar `dependsOn`:
-
-- Cada id de `dependsOn` existe en el mismo proyecto.
-- Ninguna historia depende de sí misma.
-- No hay ciclos.
-- Los `id` de las historias son únicos.
-
-Si alguna falla, la respuesta es `422`.
-
-### 5.5 Edición de historias
-
-Una historia solo se puede editar si está `pending` y no tiene un claim activo. Así nunca queda un PR ni feedback que no correspondan a la spec.
-
-Si no se cumple, la respuesta es `409`. Las historias `in_progress` o `completed` se cambian creando una historia nueva.
-
-Campos editables: `title`, `description`, `acceptanceCriteria`, `priority`, `model`, `notes` y `dependsOn`. Los demás (`id`, `status`, `stage`, `pr`, `rejections`, `runs`, `assumptions`) solo los cambia el servidor.
-
-## 6. Endpoints
-
-| Método | Ruta | Descripción |
-|---|---|---|
-| `POST` | `/projects` | Crear proyecto. |
-| `GET` | `/projects/{projectId}` | Ver proyecto con contadores. |
-| `GET` | `/projects/{projectId}/stories` | Listar historias. |
-| `GET` | `/projects/{projectId}/stories/{storyId}` | Ver historia con runs y asunciones. |
-| `POST` | `/projects/{projectId}/stories` | Añadir una historia. |
-| `PATCH` | `/projects/{projectId}/stories/{storyId}` | Editar una historia pendiente. |
-| `POST` | `/projects/{projectId}/claims` | Pedir una historia. |
-| `DELETE` | `/projects/{projectId}/claims/{claimId}` | Liberar un claim. |
-| `POST` | `/projects/{projectId}/stories/{storyId}/runs` | Registrar un run. |
-| `PATCH` | `/projects/{projectId}/stories/{storyId}/assumptions/{assumptionId}` | Marcar una asunción como revisada. |
-| `GET` | `/projects/{projectId}/progress` | Progress en markdown. |
-
-### 6.1 `POST /projects`
-
-El body tiene la forma del `prd.json` actual, más el pipeline y la configuración:
-
-```json
-{
-  "name": "MyApp",
-  "description": "Task Priority System",
-  "pipeline": ["implement", "review-spec", "review-code"],
-  "maxRejections": 3,
-  "claimTtlMinutes": 120,
-  "userStories": [
+  "spec": {
+    "title": "Display priority indicator on task cards",
+    "description": "As a user, I want to see task priority at a glance.",
+    "acceptanceCriteria": ["Each task card shows a colored priority badge", "Typecheck passes"],
+    "priority": 2,
+    "model": "med",
+    "dependsOn": ["US-001"]
+  },
+  "state": {
+    "stage": "review_code",
+    "pr": "https://github.com/mbernet/myapp/pull/12",
+    "sick": false,
+    "claim": { "id": "01JC9A...", "worker": "vps-1", "expiresAt": "2026-11-04T12:30:00Z" },
+    "summary": null
+  },
+  "runs": [
     {
-      "id": "US-001",
-      "title": "Add priority field to database",
-      "description": "...",
-      "acceptanceCriteria": ["..."],
-      "priority": 1,
-      "model": "low",
-      "dependsOn": [],
-      "notes": ""
+      "id": "01JC9F...",
+      "stage": "implement",
+      "worker": "vps-1",
+      "outcome": "pass",
+      "endedAt": "2026-11-04T10:12:00Z",
+      "body": "- Added PriorityBadge component...\n- Tests: 12 passed",
+      "assumptions": ["Not clear whether the badge shows on archived tasks. Assumed it does."]
+    },
+    {
+      "id": "01JC9K...",
+      "stage": "review_functional",
+      "worker": "vps-1",
+      "outcome": "pass",
+      "endedAt": "2026-11-04T10:40:00Z",
+      "body": "All criteria verified in the browser. Assumption about archived tasks is fine.",
+      "assumptions": []
     }
   ]
 }
 ```
 
-- Obligatorios: `name`, `pipeline` y `userStories` (al menos una). En cada historia: `id`, `title` y `priority`.
-- Se ignoran los campos de estado del `prd.json` antiguo (`passes`, `branchName`).
-- `201`, con `Location: /api/projects/{projectId}`. El body es el proyecto (4.1).
-- `422` si la validación falla (5.4 o formato).
+- `spec` solo lo escribe una persona. `state` y `runs` solo los escribe el servidor.
+- `state.claim` se muestra tal cual, también si ya ha caducado. Si está activo o no lo decide `expiresAt` frente a la hora actual.
+- Todo lo demás se deriva de `runs` (ver 5.4).
 
-### 6.2 `GET /projects/{projectId}`
-
-`200` con el proyecto (4.1). `404` si no existe.
-
-### 6.3 `GET /projects/{projectId}/stories`
-
-- Filtros opcionales, combinables: `?status=in_progress`, `?stage=review-code` y `?needsReview=true`.
-- `200` con `{ "data": [historia sin runs ni asunciones, ...] }`, ordenado por `priority` e `id`.
-
-### 6.4 `GET /projects/{projectId}/stories/{storyId}`
-
-`200` con la historia completa (4.2), con runs y asunciones. `404` si no existe.
-
-### 6.5 `POST /projects/{projectId}/stories`
-
-El body es una historia con la misma forma que en `userStories` (6.1).
-
-- La historia se crea `pending`, en la primera etapa del pipeline.
-- Puede depender de cualquier historia del proyecto, también de las que ya están `completed`.
-- `201`, con `Location: /api/projects/{projectId}/stories/{storyId}`. El body es la historia (4.2).
-- `422` si el `id` ya existe o si la validación falla (5.4).
-
-Añadir una historia a un proyecto donde todo estaba `completed` hace que `POST /claims` vuelva a devolver trabajo. Los workers que ya hayan terminado por `complete` hay que relanzarlos.
-
-### 6.6 `PATCH /projects/{projectId}/stories/{storyId}`
-
-El body contiene solo los campos que cambian (ver los editables en 5.5):
+### 4.3 Claim
 
 ```json
-{ "acceptanceCriteria": ["...", "Typecheck passes"], "dependsOn": ["US-001", "US-006"] }
+{ "id": "01JC9A...", "worker": "vps-1", "expiresAt": "2026-11-04T12:30:00Z" }
 ```
 
-- `200` con la historia completa.
-- `409` si la historia no es editable (5.5). El `message` indica el motivo: ya ha empezado o tiene un claim activo.
-- `422` si un campo no es editable o si la validación falla (5.4).
+- Cubre una etapa. Registrar el run lo borra; para la etapa siguiente se vuelve a pedir trabajo.
+- TTL fijo de 2 horas desde su creación. Tiene que cubrir la etapa más larga, incluida la espera al CI si la última etapa mergea, más algún reintento del worker (7).
+- Una tarea tiene como mucho un claim. Un claim nuevo sustituye al caducado.
+- No se libera a mano. Mientras dura, es del worker: si la ejecución falla sin resultado (rate limit, el CLI muere), el worker espera y reintenta la misma etapa con el mismo claim. Si el worker desaparece, el claim caduca y otro lo sustituye.
 
-### 6.7 `POST /projects/{projectId}/claims`
+## 5. Reglas
 
-```json
-{ "worker": "vps-1-881" }
-```
+### 5.1 Qué trabajo se reparte
 
-El servidor elige la historia según 5.1. El worker no indica etapa: la recibe en `story.stage`.
+Una tarea es elegible para un worker si:
 
-- `201`, con `Location: /api/projects/{projectId}/claims/{claimId}`. El body es el claim (4.6) con la historia completa.
-- `409` si no hay ninguna historia elegible. El body indica qué debe hacer el worker:
+1. `state.stage` no es `done`.
+2. No tiene claim activo (`claim` es `null` o `expiresAt` ya ha pasado).
+3. Todas las tareas de `dependsOn` están en `done`.
+4. No está parada a la espera de una persona (5.3).
 
-```json
-{ "message": "No eligible story", "reason": "waiting", "counts": { "...": "como en 4.1" } }
-```
+La etapa de run que recibe el worker es `doctor` si la tarea está `sick`; si no, `state.stage`.
 
-| `reason` | Significado | Qué hace el worker |
+Entre las elegibles, el servidor elige por grupos, en este orden:
+
+1. **Propias:** tareas cuyo último run hizo el worker que pide. Ya tiene la rama en local.
+2. **Nuevas:** tareas sin runs.
+3. **Ajenas:** tareas cuyo último run hizo otro worker. Solo se reparten cuando no quedan propias ni nuevas.
+
+Dentro de cada grupo: posición más avanzada en el pipeline primero (con el pipeline de ejemplo, `merge` > `review_code` > `review_functional` > `implement`), luego menor `priority` y luego menor `id`.
+
+Elegir y reservar es una operación atómica: dos peticiones simultáneas nunca reciben la misma tarea.
+
+### 5.2 Transiciones
+
+Las transiciones dependen de la posición de la etapa en el pipeline del proyecto, no de su nombre. Siendo `P` el pipeline, `P[0]` la primera etapa y `P[n]` la última, cada run registrado aplica exactamente una fila y, en todos los casos, deja `claim` a `null`.
+
+| Etapa del run | `outcome` | Efecto en `state` |
 |---|---|---|
-| `complete` | Todas las historias están `completed`. No llegará más trabajo. | Termina. |
-| `waiting` | Hay historias `pending` o `in_progress`, pero ninguna elegible ahora mismo: tienen claim o dependencias sin terminar. | Espera y vuelve a intentarlo. |
+| `P[i]`, no la última | `pass` | `stage` → `P[i+1]`. En `P[0]`, además fija `pr`. |
+| `P[n]` | `pass` | `stage` → `done`. Fija `summary`. Si el pipeline tiene una sola etapa, fija también `pr`. |
+| `P[i]`, con `i > 0` | `reject` | `stage` → `P[0]`. Tercer rechazo: además `sick` → `true`. |
+| `P[0]` | `reject` | No permitido (`422`). La primera etapa no tiene a quién devolver el trabajo. |
+| Cualquier `P[i]` | `sick` | `sick` → `true`. |
+| `doctor` | `pass` | `sick` → `false`. La tarea sigue en su `stage`. |
+| `doctor` | `reject` | `sick` → `false`. `stage` → `P[0]`. Se descarta el intento y se empieza de nuevo sobre la misma rama. |
+| `doctor` | `sick` | Sigue `sick`. Deja de repartirse hasta que intervenga una persona (5.3). |
 
-- `422` si falta `worker`.
+Además, cualquier fila que ponga `sick` a `true` en una tarea que ya tiene dos runs `doctor` la deja parada a la espera de una persona (5.3): el doctor no vuelve a intervenir.
 
-### 6.8 `DELETE /projects/{projectId}/claims/{claimId}`
+Notas:
 
-Libera el claim sin registrar ningún run. El worker lo usa cuando una ejecución falla. La historia se queda en su etapa y otro worker puede retomarla.
+- **Rechazos.** Un `reject` devuelve la tarea a `P[0]` conservando el PR: el implementador trabaja sobre la misma rama con el feedback en `runs`. Al tercer `reject` acumulado (contando todos los runs de la tarea) el servidor marca la tarea `sick` para cortar el bucle. El límite es una constante del servidor, `3`.
+- **Sick.** Marca la tarea sin cambiar `stage`. El doctor ve en `runs` qué agente la marcó y por qué.
+- **Done.** Solo se llega con un `pass` en la última etapa. Una tarea nunca está `done` sin `pr`, sin `summary` o `sick`. Que el PR esté mergeado al cerrar es responsabilidad del prompt de la última etapa, no del servidor.
+- **Cambiar el pipeline.** `PUT /projects/{project}` puede añadir, quitar o reordenar etapas. El siguiente run de cada tarea usa el pipeline que haya en ese momento. Solo se rechaza (`409`) quitar o renombrar una etapa en la que hay alguna tarea no `done`.
 
-- `204`.
-- `404` si el claim no existe o ya ha caducado.
+### 5.3 Cuándo interviene una persona
 
-### 6.9 `POST /projects/{projectId}/stories/{storyId}/runs`
+La API nunca espera a nadie: cuando un agente no puede decidir, asume, lo declara en `assumptions` y sigue. Una tarea solo se para, y pasa a `needsHuman`, cuando está `sick` y se da una de estas dos:
+
+- Su último run es un `doctor` con outcome `sick`: el doctor ha dicho que no puede.
+- Ya tiene dos runs `doctor`: el doctor ya ha intervenido dos veces y la tarea ha vuelto a enfermar. Sin este tope, un doctor que cree curar sin curar y un agente que vuelve a marcar `sick` se alternan sin fin y sin que nadie lo vea.
+
+Las tareas que dependen de una parada, directa o transitivamente, tampoco avanzarán. Entre todas forman `blocked` (4.1), y con ese número los workers saben cuándo no queda nada que hacer (6.5).
+
+Una persona recupera una tarea parada sin endpoints especiales: la pide a dedo con `POST /work` indicando `task` (6.5) y registra un run `doctor` con `pass` (continúa donde estaba) o `reject` (vuelve a la primera etapa). Ese run cuenta como intervención del doctor, así que si la tarea vuelve a enfermar irá directa a la persona otra vez. Si hace falta cambiar la spec, la edita antes (5.5).
+
+### 5.4 Qué se deriva de `runs`
+
+El servidor no guarda contadores. Todo esto se calcula al vuelo:
+
+| Dato | Cómo |
+|---|---|
+| Rechazos | Runs con `outcome: reject`. |
+| Afinidad de un worker | `worker` del último run. |
+| Asunciones | `assumptions` de los runs de la primera etapa. Están revisadas cuando les sigue un run de otra etapa con `pass`: el revisor las ve en el JSON y las da por buenas o rechaza. |
+| Fecha de cierre | `endedAt` del run que dejó la tarea en `done`. |
+| Necesita persona | `sick` y (el último run es `doctor` con `sick`, o hay dos runs `doctor`). |
+| Bloqueadas | Las que necesitan persona más las que dependen de ellas, transitivamente. |
+| Progreso del proyecto | `summary` de las tareas `done`, en orden de cierre. |
+
+### 5.5 Validación y edición de `spec`
+
+Al crear o editar una `spec`:
+
+- Debe cumplir `#/$defs/spec` del schema.
+- Cada id de `dependsOn` existe en el proyecto, no es la propia tarea y no forma ciclos.
+
+Se puede editar la `spec` de cualquier tarea que no esté `done`; en `done` responde `409`. Editar una tarea en curso es seguro: la siguiente revisión comprueba el PR contra la spec nueva y lo devuelve a la primera etapa si ya no encaja.
+
+## 6. Endpoints
+
+| Método | Ruta | Descripción |
+|---|---|---|
+| `PUT` | `/projects/{project}` | Crear o actualizar un proyecto. |
+| `GET` | `/projects/{project}` | Ver proyecto con contadores. |
+| `PUT` | `/projects/{project}/tasks/{task}` | Crear o editar la `spec` de una tarea. |
+| `GET` | `/projects/{project}/tasks` | Listar tareas completas. |
+| `GET` | `/projects/{project}/tasks/{task}` | Ver una tarea. |
+| `POST` | `/projects/{project}/work` | Pedir trabajo (claim). |
+| `POST` | `/projects/{project}/tasks/{task}/runs` | Registrar un run. |
+
+### 6.1 `PUT /projects/{project}`
 
 ```json
 {
-  "claimId": "01JC9A...",
-  "worker": "vps-1-881",
-  "stage": "implement",
-  "result": "done",
-  "body": "- Implementado el filtro...",
-  "pr": "https://github.com/mbernet/myapp/pull/12",
-  "assumptions": [
-    "No está claro si el filtro debe persistir entre sesiones. He asumido que no."
+  "description": "Task Priority System - Add priority levels to tasks",
+  "pipeline": ["implement", "review_functional", "review_code", "merge"]
+}
+```
+
+- Idempotente. `201` si lo crea, `200` si ya existía. Body: el proyecto (4.1).
+- `409` si el pipeline nuevo quita o renombra una etapa en la que hay alguna tarea no `done` (5.2). El `error` dice qué etapa y qué tareas.
+- `422` si falta `description` o `pipeline`, el id no es un slug válido, o el pipeline está vacío, repite nombres, usa un nombre reservado o uno con formato incorrecto (4.1).
+
+### 6.2 `GET /projects/{project}`
+
+`200` con el proyecto (4.1).
+
+### 6.3 `PUT /projects/{project}/tasks/{task}`
+
+El body es la `spec`:
+
+```json
+{
+  "title": "Display priority indicator on task cards",
+  "description": "As a user, I want to see task priority at a glance.",
+  "acceptanceCriteria": ["Each task card shows a colored priority badge", "Typecheck passes"],
+  "priority": 2,
+  "model": "med",
+  "dependsOn": ["US-001"]
+}
+```
+
+- Idempotente. `201` si la crea, `200` si edita. Body: la tarea completa (4.2).
+- Al crear, `state` es `{ "stage": <primera etapa del pipeline>, "pr": null, "sick": false, "claim": null, "summary": null }` y `runs` está vacío.
+- `409` si la tarea está `done`.
+- `422` si la spec no valida (5.5).
+
+Importar un `prd.json` es un `PUT` por tarea. Añadir tareas a un proyecto terminado hace que `POST /work` vuelva a repartir trabajo; los workers que ya pararon hay que relanzarlos.
+
+### 6.4 `GET /projects/{project}/tasks` y `GET /projects/{project}/tasks/{task}`
+
+- Lista: `200` con `{ "tasks": [tarea, ...] }`, ordenadas por `priority` e `id`. Sin filtros ni paginación: las tareas son pocas y pequeñas, se filtra con `jq`.
+- Detalle: `200` con la tarea.
+
+### 6.5 `POST /projects/{project}/work`
+
+```json
+{ "worker": "vps-1" }
+```
+
+El servidor elige según 5.1, crea el claim y responde `200`:
+
+```json
+{
+  "stage": "review_code",
+  "claim": { "id": "01JC9A...", "worker": "vps-1", "expiresAt": "2026-11-04T12:30:00Z" },
+  "task": { "...": "tarea completa (4.2)" },
+  "project": { "id": "myapp", "description": "...", "pipeline": ["implement", "review_functional", "review_code", "merge"] },
+  "progress": [
+    { "id": "US-001", "title": "Add priority field to database", "summary": "...", "endedAt": "2026-11-04T09:50:00Z" }
   ]
 }
 ```
 
-- Obligatorios: `claimId`, `worker`, `stage` y `result`.
-- `pr` es opcional. Si se envía, sustituye el `pr` de la historia.
-- `assumptions` es opcional: una lista de textos. Cada uno crea una asunción (4.5) asociada al run.
-- El servidor aplica la transición (5.2) y renueva o borra el claim.
-- `201` con `{ "run": run, "story": historia completa }`. El worker mira `story.status` y `story.stage` para saber si sigue y con qué etapa.
-- `409` en estos casos:
-  - `claimId` no es el claim de la historia. Pasa cuando el claim caducó y otro worker ya la ha retomado: el worker antiguo debe abandonar la historia.
-  - La historia está `completed`.
-  - `stage` no coincide con la etapa actual de la historia.
-- `422` si `result` no es válido para esa etapa (4.4).
-- En la última etapa, si el run es un `changes_requested` que provoca avance forzado, la respuesta incluye `"forcedApproval": true` y la historia sigue en esa etapa (5.2).
+- `stage` es la etapa de run que debe ejecutar el worker. Es `doctor` cuando la tarea está `sick`; si no, coincide con `task.state.stage`. El worker elige prompt y modelo a partir de `stage` y `task.spec.model`.
+- `progress` son las tareas `done` en orden de cierre. Es el `progress.txt` de siempre, y con él el agente tiene todo el contexto en una sola llamada.
 
-Un claim caducado que nadie ha sustituido sigue siendo válido: si el worker registra el run tarde, se acepta y el claim se renueva.
-
-### 6.10 `PATCH /projects/{projectId}/stories/{storyId}/assumptions/{assumptionId}`
-
-La usa una persona al revisar.
-
-```json
-{ "reviewed": true }
-```
-
-- `200` con la asunción. El servidor fija `reviewedAt`.
-- `reviewed: false` la vuelve a dejar pendiente y borra `reviewedAt`.
-- `422` si el body contiene algo distinto de `reviewed`.
-
-### 6.11 `GET /projects/{projectId}/progress`
-
-`200`, `Content-Type: text/markdown`. Se construye así:
-
-- Incluye las historias `completed`, ordenadas por `completedAt`.
-- De cada historia, toma el último run `done` de la primera etapa.
-
-```markdown
-## 2026-11-04T10:12:00Z - US-001
-<body del run>
----
-```
-
-No incluye historias que no estén `completed`, porque su código todavía no está en main. Tampoco incluye los runs de intentos rechazados: el implementador los recibe en `{{runs}}` cuando reintenta, y se pueden consultar en el detalle de la historia.
-
-## 7. Worker (`ralph.sh`)
-
-### 7.1 Ciclo
-
-`ralph.sh`, configurado con `RALPH_API_URL`, `RALPH_API_TOKEN` y `RALPH_PROJECT_ID`. Sin `RALPH_API_URL` funciona como ahora, con `prd.json` local.
-
-1. `POST /claims`. Si responde `complete`, termina. Si responde `waiting`, espera y lo vuelve a intentar.
-2. Con la historia recibida, repite por cada etapa:
-   1. Hace `git fetch` y lee el prompt de `story.stage` desde `origin/main` (7.2).
-   2. Prepara la rama:
-      - En la primera etapa: crea `ralph/{storyId}` desde `origin/main`, o la reutiliza si viene de un rechazo.
-      - En el resto: hace checkout de la rama del PR.
-   3. Descarga `GET /progress` y lo guarda como `progress.txt` local.
-   4. Lanza un agente nuevo, con contexto limpio, el prompt renderizado y el modelo de la etapa.
-   5. Si el agente termina bien:
-      - En la primera etapa: hace push de la rama y crea o actualiza el PR.
-      - En la última etapa, si el agente aprueba: mergea antes de registrar el run (7.4). Si el merge falla, registra `merge_failed` en lugar del resultado del agente.
-      - Registra el run con el resultado, el body y las asunciones que ha escrito el agente (7.3), y recibe la historia actualizada.
-      - Si la respuesta trae `forcedApproval: true`, mergea (7.4) y registra un run `approved`, o `merge_failed` si el merge falla.
-      - Si el run tenía asunciones, las comenta en el PR. Así se ven donde se revisa el código.
-   6. Si la historia sigue `in_progress`, vuelve al paso 2.1 con la nueva etapa. Si está `completed`, vuelve al paso 1.
-3. Si el agente falla: `DELETE /claims/{claimId}` y vuelve al paso 1.
-4. Si el run responde `409` porque el claim ya no es suyo: abandona la historia y vuelve al paso 1.
-
-El run se registra solo después de que el push haya ido bien. La API nunca debe dar por hecho algo que no está en git.
-
-La revisión la hace el mismo worker que implementó. Lo que la hace independiente es el contexto limpio y el prompt distinto. Para más distancia, el prompt de la revisión puede fijar otro modelo en su frontmatter.
-
-### 7.2 Prompts por etapa
-
-- El prompt de la etapa `S` está en `.ralph/stages/S.md` del repo del proyecto, y siempre se lee de `origin/main`. Así un PR no puede cambiar el prompt con el que se revisa a sí mismo.
-- Si no existe, el worker usa `prompts/S.md` de Ralph.
-- El frontmatter opcional fija el modelo: `model: low | med | max`. Si la historia tiene `model`, prevalece el de la historia.
-- Todos los prompts deben indicar al agente que nunca se detenga a esperar a una persona: si algo requiere una decisión humana, hace la asunción más razonable, la declara y continúa.
-- El prompt de la primera etapa debe cubrir el caso en que el último run es `merge_failed`: integrar `origin/main` en la rama, resolver los conflictos respetando la intención de las dos partes (el progress de la historia que ya está en main explica la suya), arreglar el CI si ese era el motivo, ejecutar los tests y hacer push.
-
-Variables disponibles en el prompt:
-
-| Variable | Valor |
-|---|---|
-| `{{storyId}}`, `{{title}}`, `{{description}}` | Campos de la historia. |
-| `{{acceptanceCriteria}}` | Lista en markdown. |
-| `{{pr}}` | URL del PR o vacío. |
-| `{{runs}}` | Historial de runs de la historia en markdown, incluido el feedback de las revisiones. |
-| `{{assumptions}}` | Asunciones de la historia en markdown, indicando las que ya están revisadas. |
-| `{{rejections}}`, `{{maxRejections}}` | Cuántas veces ha vuelto la historia a la primera etapa, y el límite. Así el revisor sabe si su rechazo la devolverá o forzará el avance. |
-| `{{branch}}` | `ralph/{storyId}`. |
-
-### 7.3 Salida del agente
-
-El agente deja un fichero `ralph-result.json` en la raíz del worktree:
+Si no hay nada elegible, `200` con:
 
 ```json
 {
-  "result": "done",
-  "body": "- Implementado el filtro...",
-  "assumptions": ["No está claro si el filtro debe persistir entre sesiones. He asumido que no."]
+  "stage": null,
+  "finished": false,
+  "counts": { "total": 5, "done": 2, "claimed": 1, "sick": 1, "needsHuman": 1, "blocked": 2 }
 }
 ```
 
-- `result`: `done`, `approved` o `changes_requested`. `merge_failed` nunca lo escribe el agente.
-- `body`: el `body` del run, en markdown.
-- `assumptions`: opcional.
+`finished` es `true` cuando `done + blocked == total`: todo lo que no está hecho está parado o depende de algo parado, y no llegará más trabajo sin una persona. El worker termina. Si es `false`, espera y vuelve a pedir. `counts` se incluye para que una persona vea por qué.
 
-El fichero no se commitea. Los Codebase Patterns siguen yendo en `CLAUDE.md`, dentro del PR.
+**Pedir una tarea concreta.** Con `{ "worker": "marc", "task": "US-003" }` el servidor reserva esa tarea saltándose la elegibilidad de 5.1, salvo que esté `done` o tenga claim activo (`409`). Sirve para que una persona recupere una tarea parada (5.3) y para el `--story` de `ralph.sh`.
 
-### 7.4 Git y merge
+- `422` si falta `worker` o no es un id válido.
 
-- Una rama por historia: `ralph/{storyId}`, creada desde `main`. El PR va contra `main`.
-- El merge no es una etapa ni lo hace un agente. Lo hace `ralph.sh` cuando la última etapa aprueba, antes de registrar ese run.
+### 6.6 `POST /projects/{project}/tasks/{task}/runs`
 
-Procedimiento de merge:
-
-```
-git fetch
-git merge origin/main      # sobre ralph/{storyId}; sin rebase, para no hacer force push
-git push
-gh pr checks --watch       # espera al CI
-gh pr merge --squash
+```json
+{
+  "claimId": "01JC9A...",
+  "outcome": "pass",
+  "body": "- Added PriorityBadge component...\n- Tests: 12 passed",
+  "assumptions": ["Not clear whether the badge shows on archived tasks. Assumed it does."],
+  "pr": "https://github.com/mbernet/myapp/pull/12",
+  "summary": null
+}
 ```
 
-| Qué pasa | Qué hace `ralph.sh` |
-|---|---|
-| Todo va bien | Registra el run `approved`. La historia pasa a `completed`. No hace falta volver a revisar: la rama solo se ha puesto al día con main, y si eso rompe algo lo detecta el CI. |
-| `git merge` da conflictos | `git merge --abort` y registra `merge_failed`. En el body pone los ficheros en conflicto y las historias mergeadas desde que se creó la rama. |
-| El CI falla, o `gh pr merge` falla | Registra `merge_failed`. En el body pone los checks que han fallado y un extracto del log. |
+- Obligatorios: `claimId`, `outcome`, `body`.
+- El servidor completa el run con `id`, `endedAt`, y `stage` y `worker` sacados del claim. El cliente no puede declarar una etapa distinta de la que se le asignó.
+- `assumptions`: solo en la primera etapa del pipeline. En otras etapas, vacío u omitido.
+- `pr`: solo en la primera etapa. Obligatorio en un `pass` si `state.pr` es `null`; si ya hay PR, opcional y lo sustituye.
+- `summary`: solo en la última etapa con `pass`, y obligatorio ahí. Es el resumen que verán los siguientes agentes en `progress`: qué se hizo y qué conviene saber del código.
+- `outcome`: `reject` no se admite en la primera etapa (5.2).
+- `201` con la tarea completa ya transicionada (5.2).
+- `409` si `claimId` no es el claim actual de la tarea. Pasa cuando el claim caducó y otro worker ya la ha retomado: el worker antiguo descarta su resultado. Un claim caducado que nadie ha sustituido sigue siendo válido.
+- `422` si el `outcome` no es válido para la etapa, o faltan o sobran `pr`, `summary` o `assumptions`.
 
-Después de un `merge_failed`, la historia vuelve a la primera etapa. El agente resuelve el problema (7.2) y la historia repasa todas las revisiones, porque el código ha cambiado. Cuando la última revisión vuelve a aprobar, se repite este procedimiento.
+## 7. Ciclo del worker
 
-Las protecciones de rama de GitHub deben exigir que el CI pase antes de mergear.
+```
+loop:
+  r = POST /work { worker }
+  if r.stage == null:
+     if r.finished: exit
+     sleep; continue
+  loop:
+     run agent(prompt[r.stage], model[r.stage, r.task.spec.model], context = r)
+     if the agent produced a result:
+        POST /tasks/{id}/runs { claimId, outcome, body, assumptions?, pr?, summary? }
+        break
+     wait = rate limit reset time if known, else backoff
+     if now + wait + MARGIN >= r.claim.expiresAt: break   # the claim is about to stop being ours: drop the task
+     sleep(wait)
+  if no result was registered:
+     sleep(rate limit reset time if known, else long backoff)   # don't ask for more work without quota
+```
 
-## 8. Decisiones cerradas
+Cuando la ejecución no produce resultado, el worker no toca la API: el claim sigue siendo suyo, espera lo que marque el rate limit y reintenta la misma etapa. Así un worker limitado no devuelve la tarea al reparto para volver a recibirla por afinidad un segundo después.
 
-- **Sin bloqueos:** las historias nunca esperan a una persona. Lo que requiere una decisión humana se resuelve con una asunción declarada, y la historia sigue.
-- **Límite de rechazos:** al alcanzar `maxRejections`, el siguiente rechazo fuerza el avance y crea una asunción con el motivo.
-- **Revisión humana:** no hay avisos. Las historias con asunciones sin revisar se consultan con `GET /stories?needsReview=true` y se ven también en los comentarios del PR.
-- **Cambios en el PRD:** se pueden añadir historias en cualquier momento y editar las `pending` sin claim activo. No se pueden borrar historias ni editar las que ya han empezado.
-- **Progress:** solo incluye el último run de implementación de cada historia `completed`.
-- **Merge sin agente:** lo hace `ralph.sh` cuando la última revisión aprueba. Si falla, la historia vuelve a implementar con `merge_failed`, que no cuenta como rechazo.
-- **Un worker por historia:** el worker lleva la historia desde la implementación hasta el merge, con un agente nuevo en cada etapa. Si el worker desaparece, otro la retoma en la etapa en la que estaba.
-- **Estado y etapa:** son dos campos separados. `status` es el ciclo de vida; `stage`, la etapa del pipeline.
+Dos reglas locales, sin llamadas a la API, evitan que los reintentos hagan daño:
 
-## 9. Riesgos conocidos
+- **El claim manda.** El worker solo reintenta si, al despertar, le queda margen hasta `expiresAt` para terminar la etapa (`MARGIN`, una constante del worker: media hora). Pasado ese punto la tarea ya no es suya: otro worker puede tener un claim nuevo y estar en la misma rama, y un agente tardío haría push encima. El `409` de 6.6 es la última red, no la primera.
+- **Sin cuota no se pide trabajo.** Si suelta una tarea sin resultado, el worker espera hasta el reset del rate limit (o un backoff largo si el fallo no es de cuota) antes de volver a `POST /work`. Si no, iría encadenando tareas, bloqueando cada una dos horas sin tocarla, y los workers que sí tienen cuota no podrían cogerlas.
 
-- **CI que falla siempre.** `merge_failed` no tiene límite. Si el agente no consigue arreglar el CI, la historia da vueltas indefinidamente entre implementar, revisar y mergear. Los conflictos no tienen este problema, porque integrar main los resuelve. Si llega a pasar, se puede añadir un límite propio para `merge_failed`.
+La tarea soltada vuelve al reparto cuando su claim caduca. Un run registrado después de caducar sigue valiendo mientras nadie haya sustituido el claim (6.6). Los fallos de infraestructura no dejan rastro en `runs`; su sitio es el ledger de uso del propio worker.
+
+El agente recibe el JSON de `POST /work` entero. De él saca la spec, el PR, el feedback de revisiones anteriores, las asunciones declaradas y el progreso del proyecto. No necesita leer el PR ni ningún fichero de estado.
+
+Cómo devuelve el agente su resultado al worker queda fuera de la API. En `ralph.sh` lo escribe en un fichero JSON que el script valida y envía; el diseño está en [`worker-proposal.md`](worker-proposal.md).
+
+El worker tiene un prompt por cada nombre de etapa del pipeline del proyecto, más uno para `doctor`. Si recibe una etapa para la que no tiene prompt, no registra nada y avisa: es un error de configuración del worker, no de la tarea. `project.pipeline` viene en la respuesta de `POST /work` para que pueda comprobarlo antes de empezar.
+
+Ejemplo de vida de una tarea con un rechazo, con el pipeline de ejemplo:
+
+| # | `stage` del run | worker | outcome | `state` después |
+|---|---|---|---|---|
+| 1 | `implement` | `vps-1` | `pass` | `review_functional`, pr #12 |
+| 2 | `review_functional` | `vps-1` | `pass` | `review_code` |
+| 3 | `review_code` | `mac-marc` | `reject` | `implement` |
+| 4 | `implement` | `mac-marc` | `pass` | `review_functional` |
+| 5 | `review_functional` | `mac-marc` | `pass` | `review_code` |
+| 6 | `review_code` | `vps-1` | `pass` | `merge` |
+| 7 | `merge` | `vps-1` | `pass` | `done`, summary fijado |
+
+## 8. Decisiones tomadas y por confirmar
+
+- **El pipeline lo define cada proyecto y el servidor solo mira posiciones.** Primera etapa: produce el PR, declara asunciones, no puede rechazar. Intermedias y última: pueden rechazar hacia la primera. Última: cierra con `summary`. Con eso el servidor no necesita saber qué es "revisar" ni "mergear", y un proyecto puede tener dos etapas y otro seis. El precio es que el schema de tarea ya no valida nombres ni reglas por etapa: lo hace el servidor contra el pipeline del proyecto.
+- **Claim por etapa, no por pipeline.** Cada etapa pide trabajo de nuevo. La afinidad de 5.1 hace que en la práctica el mismo worker encadene las etapas, pero sin obligación: si muere, otro continúa sin esperar a que caduque nada más que un claim.
+- **La afinidad ordena, no reserva.** Un worker sigue con sus tareas y solo coge las de otro cuando no hay nada nuevo. Si el worker de una tarea desaparece, la tarea espera hasta que se acaben las historias nuevas. Con un backlog grande, eso puede tardar.
+- **TTL fijo de 2 h, límite de 3 rechazos y 2 intervenciones del doctor.** Constantes del servidor. Si hace falta, pasan a ser campos del proyecto; de momento no.
+- **Sin endpoint de progreso.** Va dentro de `POST /work`. Una persona lo lee con `GET /tasks` y `jq`.
+- **Sin renovación ni liberación de claim.** Un claim solo muere por run o por TTL. Liberarlo al vuelo provocaba un bucle: el worker con rate limit soltaba la tarea y la recibía otra vez por afinidad, sin pausa y sin rastro. Ahora el worker reintenta con su propio claim, y solo mientras `expiresAt` le deja margen. Si una etapa supera el TTL, otro worker puede retomarla y el run tardío recibe `409`. Es raro y el coste es repetir una etapa.
+- **La parada es transitiva.** Una tarea parada arrastra a las que dependen de ella. `finished` en `POST /work` lo tiene en cuenta; si no, los workers reintentarían para siempre esperando a una dependencia que nunca cerrará.
+- **Editar la spec de una tarea en curso está permitido.** El pipeline se autocorrige vía rechazo. Es más simple que bloquear.
+
+## 9. Panel
+
+Una vista de solo lectura, por proyecto, para que una persona vea de un vistazo cómo va el desarrollo y qué le toca a ella. Se actualiza sola, sin recargar a mano. Dónde se sirve y cómo se implementa se decide al hacerlo; esta sección solo fija qué muestra.
+
+Cuatro columnas por estado, en este orden:
+
+| Columna | Qué tareas | Criterio |
+|---|---|---|
+| Pendientes | Aún no han empezado. | `runs` está vacío. |
+| En curso | Están en el pipeline. | Cualquier otra tarea no `done` que no esté parada. |
+| Paradas | Necesitan a una persona. | `needsHuman`, o `blocked` por depender de una. |
+| Hechas | PR mergeado. | `stage` es `done`. |
+
+Cada tarjeta muestra el `id`, el título, la `priority` y, según el caso:
+
+- La etapa actual, para las tareas en curso.
+- El worker que la tiene reservada y hasta cuándo, si hay claim activo.
+- Un enlace al PR, si lo hay.
+- Marcas de atención: `sick`, número de rechazos, número de asunciones declaradas, y por qué está parada (diagnóstico del doctor, o id de la tarea que la bloquea).
+- La fecha de cierre, para las hechas.
+
+Las columnas se ordenan igual que el reparto de trabajo (5.1): etapa más avanzada primero, luego `priority`, luego `id`. Las hechas van por fecha de cierre, la más reciente arriba.
+
+Encima de las columnas, el nombre y la descripción del proyecto y los `counts` de 4.1. Cada tarjeta enlaza a `GET /projects/{project}/tasks/{task}` para ver el JSON completo con sus runs; el panel no reproduce el historial, solo señala dónde mirar.
+
+El panel no permite actuar: editar specs y rescatar tareas paradas se hace con la API (5.3, 6.3). Si con el uso hace falta algo más, se añade entonces.
