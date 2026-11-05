@@ -1,10 +1,9 @@
 {
-  "project": "MyApp",
-  "branchName": "ralph/task-priority",
+  "project": "myapp",
   "description": "Task Priority System - Add priority levels to tasks",
-  "userStories": [
-    {
-      "id": "US-001",
+  "pipeline": ["implement", "review_functional", "review_code", "merge"],
+  "tasks": {
+    "US-001": {
       "title": "Add priority field to database",
       "description": "As a developer, I need to store task priority so it persists across sessions.",
       "acceptanceCriteria": [
@@ -14,11 +13,9 @@
       ],
       "priority": 1,
       "model": "low",
-      "passes": false,
-      "notes": ""
+      "dependsOn": []
     },
-    {
-      "id": "US-002",
+    "US-002": {
       "title": "Display priority indicator on task cards",
       "description": "As a user, I want to see task priority at a glance.",
       "acceptanceCriteria": [
@@ -29,11 +26,9 @@
       ],
       "priority": 2,
       "model": "med",
-      "passes": false,
-      "notes": ""
+      "dependsOn": ["US-001"]
     },
-    {
-      "id": "US-003",
+    "US-003": {
       "title": "Add priority selector to task edit",
       "description": "As a user, I want to change a task's priority when editing it.",
       "acceptanceCriteria": [
@@ -43,13 +38,11 @@
         "Typecheck passes",
         "Verify in browser using dev-browser skill"
       ],
-      "priority": 3,
+      "priority": 2,
       "model": "med",
-      "passes": false,
-      "notes": ""
+      "dependsOn": ["US-001"]
     },
-    {
-      "id": "US-004",
+    "US-004": {
       "title": "Filter tasks by priority",
       "description": "As a user, I want to filter the task list to see only high-priority items.",
       "acceptanceCriteria": [
@@ -59,13 +52,11 @@
         "Typecheck passes",
         "Verify in browser using dev-browser skill"
       ],
-      "priority": 4,
+      "priority": 3,
       "model": "med",
-      "passes": false,
-      "notes": ""
+      "dependsOn": ["US-002"]
     },
-    {
-      "id": "US-005",
+    "US-005": {
       "title": "Apply priority sorting to every task list in the app",
       "description": "As a user, I want high-priority tasks first everywhere tasks appear.",
       "acceptanceCriteria": [
@@ -75,10 +66,9 @@
         "Typecheck passes",
         "Verify in browser using dev-browser skill"
       ],
-      "priority": 5,
-      "model": "max",
-      "passes": false,
-      "notes": "Wide but shallow: many call sites, one small change each. That is what max is for."
+      "priority": 4,
+      "model": "high",
+      "dependsOn": ["US-002", "US-003", "US-004"]
     }
-  ]
+  }
 }

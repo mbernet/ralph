@@ -2,20 +2,33 @@
 
 ![Ralph](ralph.webp)
 
-Ralph is an autonomous AI agent loop that runs AI coding tools ([Amp](https://ampcode.com) or [Claude Code](https://docs.anthropic.com/en/docs/claude-code)) repeatedly until all PRD items are complete. Each iteration is a fresh instance with clean context. Memory persists via git history, `progress.txt`, and `prd.json`.
+Ralph is an autonomous AI agent loop that runs AI coding tools ([Amp](https://ampcode.com) or [Claude Code](https://docs.anthropic.com/en/docs/claude-code)) repeatedly until every task of a PRD is merged. Each iteration is a fresh instance with clean context. Memory persists via git and a small task API that several workers share.
 
 Based on [Geoffrey Huntley's Ralph pattern](https://ghuntley.com/ralph/).
 
 [Read my in-depth article on how I use Ralph](https://x.com/ryancarson/status/2008548371712135632)
 
+## How it works
+
+The original Ralph kept everything in two local files, `prd.json` and `progress.txt`: one worker, one checkout, no review. This version moves that state into an API ([spec](docs/central-prd-spec.md)) so that several workers can share one project:
+
+- A task goes through a **pipeline** of stages that each project defines. The default is `implement` → `review_functional` → `review_code` → `merge`.
+- Each stage is one agent run with a clean context and its own prompt. A reviewer can **reject**, which sends the task back to the first stage with the feedback.
+- Every task gets its own branch (`ralph/<task id>`) and pull request, and ends merged into `main`.
+- Nothing waits for a person. An agent that cannot decide makes an assumption and declares it. A task that cannot move is marked **sick** and a **doctor** run looks at it; only when the doctor gives up does it wait for someone.
+
+`ralph.sh` owns the conversation with the API: it asks for work, hands the agent the whole answer as context, and registers the result the agent leaves in a file. The agent never picks a task and never sees the API token.
+
 ## Prerequisites
 
+- A running Ralph API and its token (see [the spec](docs/central-prd-spec.md))
 - One of the following AI coding tools installed and authenticated:
   - [Amp CLI](https://ampcode.com) (default)
-  - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`npm install -g @anthropic-ai/claude-code`) - version 2.1 or newer for streaming output, per-story models and rate-limit pacing; older versions fall back to plain output
-- `jq` installed (`brew install jq` on macOS)
+  - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`npm install -g @anthropic-ai/claude-code`) - version 2.1 or newer for streaming output, per-task models and rate-limit pacing; older versions fall back to plain output
+- [`gh`](https://cli.github.com) authenticated, with permission to open and merge pull requests: the agents use it, and the API only accepts GitHub pull request URLs
+- `jq` and `curl` installed (`brew install jq` on macOS)
 - `bash` 3.2 or newer (stock macOS bash is fine)
-- A git repository for your project
+- A clone of your project **for each worker**. A worker switches branches between stages, so it must not share a working copy with a person
 
 ## Setup
 
@@ -27,14 +40,12 @@ Copy the ralph files into your project:
 # From your project root
 mkdir -p scripts/ralph
 cp /path/to/ralph/ralph.sh scripts/ralph/
-
-# Copy the prompt template for your AI tool of choice:
-cp /path/to/ralph/prompt.md scripts/ralph/prompt.md    # For Amp
-# OR
-cp /path/to/ralph/CLAUDE.md scripts/ralph/CLAUDE.md    # For Claude Code
+cp -r /path/to/ralph/prompts scripts/ralph/
 
 chmod +x scripts/ralph/ralph.sh
 ```
+
+Add `scripts/ralph/.ralph/` to your `.gitignore`: it holds the connection settings, the usage ledger and the logs.
 
 ### Option 2: Install skills globally (Amp)
 
@@ -68,11 +79,29 @@ Then install the skills:
 
 Available skills after installation:
 - `/prd` - Generate Product Requirements Documents
-- `/ralph` - Convert PRDs to prd.json format
+- `/ralph` - Convert PRDs to prd.json format and import them into the Ralph API
 
 Skills are automatically invoked when you ask Claude to:
 - "create a prd", "write prd for", "plan this feature"
 - "convert this prd", "turn into ralph format", "create prd.json"
+
+### Connect to the API
+
+Put the connection in `scripts/ralph/.ralph/env`, one `KEY=value` per line, or export the same variables. The environment wins over the file.
+
+```
+RALPH_API_URL=http://localhost:8090/api/ralph
+RALPH_API_TOKEN=...
+RALPH_PROJECT=myapp
+RALPH_WORKER=vps-1
+```
+
+| Variable | Meaning |
+|----------|---------|
+| `RALPH_API_URL` | base URL of the Ralph API |
+| `RALPH_API_TOKEN` | the token of that deployment |
+| `RALPH_PROJECT` | slug of the project to work on |
+| `RALPH_WORKER` | stable name of this worker (default: the hostname). The server uses it to give a worker its own tasks first |
 
 ### Configure Amp auto-handoff (recommended)
 
@@ -84,7 +113,7 @@ Add to `~/.config/amp/settings.json`:
 }
 ```
 
-This enables automatic handoff when context fills up, allowing Ralph to handle large stories that exceed a single context window.
+This enables automatic handoff when context fills up, allowing Ralph to handle large tasks that exceed a single context window.
 
 ## Workflow
 
@@ -98,15 +127,21 @@ Load the prd skill and create a PRD for [your feature description]
 
 Answer the clarifying questions. The skill saves output to `tasks/prd-[feature-name].md`.
 
-### 2. Convert PRD to Ralph format
+### 2. Convert the PRD and import it
 
-Use the Ralph skill to convert the markdown PRD to JSON:
+Use the Ralph skill to convert the markdown PRD to JSON and load it into the API:
 
 ```
 Load the ralph skill and convert tasks/prd-[feature-name].md to prd.json
 ```
 
-This creates `prd.json` with user stories structured for autonomous execution.
+This writes `prd.json` (see [`prd.json.example`](prd.json.example)) and imports it. You can also import by hand, after reading or editing the file:
+
+```bash
+./scripts/ralph/ralph.sh --import prd.json
+```
+
+The import is idempotent: run it again to edit specs or to add tasks to a project that is already running. Finished tasks are left as they are.
 
 ### 3. Run Ralph
 
@@ -118,71 +153,72 @@ This creates `prd.json` with user stories structured for autonomous execution.
 ./scripts/ralph/ralph.sh --tool claude [max_iterations]
 ```
 
-Default is 10 iterations. Use `--tool amp` or `--tool claude` to select your AI coding tool.
+Start as many workers as you want, each in its own clone and with its own `RALPH_WORKER`.
 
-Ralph will:
-1. Create a feature branch (from PRD `branchName`)
-2. **The script** picks the highest priority story where `passes: false`, resolves its
-   `model` tier, and tells the agent to work on exactly that story
-3. The agent implements that single story
-4. Run quality checks (typecheck, tests)
-5. Commit if checks pass
-6. Update `prd.json` to mark story as `passes: true`
-7. Append learnings to `progress.txt`
-8. Read the real 5h/7d rate-limit window and throttle, wait for the reset, or stop
-9. Repeat until all stories pass or max iterations reached
+Default is 10 iterations. One iteration is one agent run, and a task takes one per stage: four with the default pipeline, more if a reviewer rejects it.
+
+On every iteration Ralph will:
+1. Read the real 5h/7d rate-limit window and throttle, wait for the reset, or stop
+2. Ask the API for work. The server picks the task: the worker's own tasks first, then new ones, then other workers' abandoned ones, always respecting `dependsOn`
+3. Resolve the task's `model` tier and pick the prompt of the stage
+4. Run the agent with the whole answer of the API as context: the spec, the PR, the feedback of earlier runs, the declared assumptions and the summaries of the finished tasks
+5. Read the result the agent wrote (`pass`, `reject` or `sick`) and register it. The server moves the task
+6. Repeat until the server says nothing more will come, or max iterations is reached
+
+If the agent ends without a result (a rate limit, a crash), the worker keeps its claim and retries the same stage, but only while the claim leaves room to finish it. If it ends twice without a usable result for another reason (the turn limit, a malformed result), Ralph marks the task sick so the doctor looks at it.
 
 ### Options
 
 | Flag | Effect |
 |------|--------|
 | `--tool <amp\|claude>` | agent CLI to run (default `amp`) |
-| `<number>` | max iterations (default 10) |
-| `--story US-00X` | force a specific story |
+| `<number>` | max agent runs (default 10) |
+| `--story US-00X` | work on this task only, skipping the eligibility rules |
+| `--import <file>` | create or update the project and its tasks from a PRD, then exit |
 | `--no-pace` | disable rate-limit pacing (report only) |
 | `--hard-pct <n>` | 5h window budget percent (default 85) |
 | `--quiet` | do not render the live agent stream |
 | `--dry-run` | render every UI state with fake data, no API calls |
-| `--scenario <name>` | dry-run path: `mixed\|throttle\|hardstop\|ratelimit\|maxturns\|complete` |
+| `--scenario <name>` | dry-run path: `mixed\|throttle\|hardstop\|ratelimit\|maxturns\|complete\|reject\|sick\|nowork\|conflict` |
 | `--fast` | shorten every sleep to 8s (use with `--dry-run`) |
-| `--explain` | print the resolved config, story and pace decision, then exit |
+| `--explain` | print the resolved config, project and pace decision, then exit |
 
-Exit codes: `0` all stories pass, `1` max iterations reached, `2` rate-limit window
-exhausted, `3` a story made no progress twice in a row, `4` configuration error.
+Exit codes: `0` nothing is left to do, `1` max iterations reached, `2` rate-limit window
+exhausted, `3` what is left waits for a person, `4` configuration or authentication
+error, `5` the agent crashed twice in a row, `6` the Ralph API cannot be reached.
 
-## Per-Story Model Tiers
+### When a task waits for a person
 
-Every user story carries a `model` tier so mechanical work does not cost the same as a
+A sick task goes to the doctor. If the doctor gives up, or the task falls sick again after two doctor runs, it stops being handed out, and so does everything that depends on it. The worker ends with exit code `3` and lists those tasks with the doctor's diagnosis.
+
+Fix the cause (correct the spec with another `--import`, repair the environment), then send the doctor again:
+
+```bash
+./scripts/ralph/ralph.sh --tool claude --story US-003
+```
+
+`--story` asks for that task by id, which is how a stopped task is rescued, and keeps working on it until it is done.
+
+## Per-Task Model Tiers
+
+Every task carries a `model` tier so mechanical work does not cost the same as a
 cross-cutting refactor:
 
 | Tier | Model | For |
 |------|-------|-----|
 | `low` | `sonnet` | Migrations, seeders, factories, CRUD scaffolding, config, copy - work fully determined by the acceptance criteria |
 | `med` | `opus` | The default. Normal feature work needing a judgment call (200k context) |
-| `max` | `claude-opus-5[1m]` | Wide-but-shallow work that must see many files at once (1M context) |
+| `high` | `claude-opus-5[1m]` | Wide-but-shallow work that must see many files at once (1M context) |
 
-```json
-{
-  "id": "US-001",
-  "title": "Add priority field to database",
-  "priority": 1,
-  "model": "low",
-  "passes": false
-}
-```
-
-The field is optional: a story without it runs on `med`. `modelTier` and `tier` are
-accepted as aliases. Override the mapping with `RALPH_MODEL_LOW`, `RALPH_MODEL_MED` and
-`RALPH_MODEL_MAX` (model ids age, and `claude-opus-5[1m]` has to be quoted in a shell).
-
-Because the script needs to know the tier *before* it starts the agent, the script - not
-the agent - selects the story, and appends a `## This Iteration` block to the prompt
-naming it. `--tool amp` ignores tiers entirely; amp has no model selector.
+The tier of a task applies to every one of its stages. The doctor runs on its own tier,
+`high` by default (`RALPH_DOCTOR_TIER`). Override the mapping with `RALPH_MODEL_LOW`,
+`RALPH_MODEL_MED` and `RALPH_MODEL_HIGH` (model ids age, and `claude-opus-5[1m]` has to
+be quoted in a shell). `--tool amp` ignores tiers entirely; amp has no model selector.
 
 The `/ralph` skill assigns the tiers when it converts your PRD, using the heuristics in
 `skills/ralph/SKILL.md`. The short version: default to `med`; use `low` when a competent
-junior could do it from the criteria alone; use `max` only for genuinely wide work. If
-you want `max` because a story is *big*, split the story instead.
+junior could do it from the criteria alone; use `high` only for genuinely wide work. If
+you want `high` because a task is *big*, split the task instead.
 
 ## Rate-Limit Pacing
 
@@ -228,8 +264,11 @@ Four possible actions:
 - **stop** - the 7-day limit is nearly gone. Sleeping inside a run cannot fix that, so
   Ralph stops with exit code 2 rather than cost you a week.
 
-Rate-limit errors are detected from the iteration result and **retried without consuming
-an iteration** (`RALPH_MAX_RETRIES`, default 3), backing off to the window reset.
+Rate-limit errors are detected from the iteration result and the stage is **retried
+under the same claim**, backing off to the window reset, for as long as the claim leaves
+room to finish it (`RALPH_CLAIM_MARGIN_S`, default 1800). Past that point the worker lets
+the task go, because another worker may already be on its branch, and does not ask for
+more work until there is quota again.
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
@@ -239,7 +278,7 @@ an iteration** (`RALPH_MAX_RETRIES`, default 3), backing off to the window reset
 | `RALPH_MAX_SLEEP_S` | `900` | cap on a throttle nap |
 | `RALPH_MAX_WAIT_S` | `21600` | cap on waiting for a reset |
 | `RALPH_MIN_DELAY_S` | `5` | breather between iterations |
-| `RALPH_MAX_RETRIES` | `3` | rate-limit retries per story |
+| `RALPH_CLAIM_MARGIN_S` | `1800` | room a retry needs before the claim expires |
 | `RALPH_ITER_BUDGET_USD` | unset | per-iteration `--max-budget-usd` |
 | `RALPH_WARN_PCT` | `90` | where the server starts warning |
 | `RALPH_USAGE_PROBE` | `1` | read the real usage from the API headers |
@@ -255,13 +294,17 @@ subscription usage, which says nothing about amp's consumption.
 ## Output and Logs
 
 Each iteration streams what the agent is doing (tool calls, results, narration), then
-prints a summary with duration, turns, tokens, cost, the commit created, whether the
-story flipped to `passes: true`, and the window state.
+prints a summary with duration, turns, tokens, cost, the commit created, what became of
+the stage (`US-002  review_code ✓ pass → merge`), how many tasks are done, and the
+window state.
 
 ```
 .ralph/
-├── usage.jsonl                     # append-only ledger, one line per iteration
+├── env                             # connection settings (optional)
+├── usage.jsonl                     # append-only ledger, one line per agent run
 └── logs/20260730-114233/
+    ├── iter-05.work.json           # what the API handed out: the agent's context
+    ├── iter-05.result.json         # what the agent answered
     ├── iter-05.stream.jsonl        # raw stream-json, full fidelity
     └── iter-05.stderr.log
 ```
@@ -273,33 +316,35 @@ locales.
 To iterate on the output without spending anything:
 
 ```bash
-./ralph.sh --dry-run --fast              # every UI state, fake data, ~40s, $0
-./ralph.sh --dry-run --scenario hardstop # just the wait-for-reset path
-./ralph.sh --explain                     # real story + real window, no API call
+./ralph.sh --dry-run --fast              # the loop against a fake API, fake agent, $0
+./ralph.sh --dry-run --scenario reject   # a review that sends the task back
+./ralph.sh --dry-run --scenario maxturns # a task that ends up waiting for a person
+./ralph.sh --explain                     # real project + real window, claims nothing
 ```
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `ralph.sh` | The bash loop that spawns fresh AI instances (supports `--tool amp` or `--tool claude`) |
-| `prompt.md` | Prompt template for Amp |
-| `CLAUDE.md` | Prompt template for Claude Code |
-| `prd.json` | User stories with `passes` status and `model` tier (the task list) |
-| `prd.json.example` | Example PRD format for reference |
-| `progress.txt` | Append-only learnings for future iterations |
-| `.ralph/usage.jsonl` | Usage ledger: one line per iteration (gitignored) |
-| `.ralph/logs/` | Raw per-iteration agent transcripts (gitignored) |
+| `ralph.sh` | The bash loop: asks the API for work, spawns a fresh AI instance, registers the result |
+| `prompts/_common.md` | Rules every agent run shares |
+| `prompts/<stage>.md` | What one stage of the pipeline does. One file per stage, plus `doctor.md` |
+| `prd.json` | The PRD being prepared for an import (gitignored) |
+| `prd.json.example` | Example PRD in the import format |
+| `docs/central-prd-spec.md` | Spec of the task API |
+| `.ralph/env` | Connection settings (gitignored) |
+| `.ralph/usage.jsonl` | Usage ledger: one line per agent run (gitignored) |
+| `.ralph/logs/` | Per-iteration context, result and raw transcript (gitignored) |
 | `skills/prd/` | Skill for generating PRDs (works with Amp and Claude Code) |
-| `skills/ralph/` | Skill for converting PRDs to JSON (works with Amp and Claude Code) |
+| `skills/ralph/` | Skill for converting PRDs to JSON and importing them (works with Amp and Claude Code) |
 | `.claude-plugin/` | Plugin manifest for Claude Code marketplace discovery |
-| `flowchart/` | Interactive visualization of how Ralph works |
+| `flowchart/` | Interactive visualization of the original, file-based loop |
 
 ## Flowchart
 
 [![Ralph Flowchart](ralph-flowchart.png)](https://snarktank.github.io/ralph/)
 
-**[View Interactive Flowchart](https://snarktank.github.io/ralph/)** - Click through to see each step with animations.
+**[View Interactive Flowchart](https://snarktank.github.io/ralph/)** - Click through to see each step with animations. It shows the original loop, before the task API.
 
 The `flowchart/` directory contains the source code. To run locally:
 
@@ -314,15 +359,17 @@ npm run dev
 ### Each Iteration = Fresh Context
 
 Each iteration spawns a **new AI instance** (Amp or Claude Code) with clean context. The only memory between iterations is:
-- Git history (commits from previous iterations)
-- `progress.txt` (learnings and context)
-- `prd.json` (which stories are done)
+- Git history (the branch and pull request of the task)
+- The runs of the task: every report, review and diagnosis written so far
+- The summaries of the finished tasks: what the project has learnt about its own code
+
+All of it reaches the agent in its prompt. It does not have to go and look.
 
 ### Small Tasks
 
-Each PRD item should be small enough to complete in one context window. If a task is too big, the LLM runs out of context before finishing and produces poor code.
+Each task should be small enough to implement in one context window. If a task is too big, the LLM runs out of context before finishing and the task falls sick.
 
-Right-sized stories:
+Right-sized tasks:
 - Add a database column and migration
 - Add a UI component to an existing page
 - Update a server action with new logic
@@ -333,9 +380,13 @@ Too big (split these):
 - "Add authentication"
 - "Refactor the API"
 
+### Dependencies Order the Work
+
+A task is handed out only when everything in its `dependsOn` is merged. That is what orders the work, and what lets several workers run at once. `priority` only breaks ties.
+
 ### AGENTS.md Updates Are Critical
 
-After each iteration, Ralph updates the relevant `AGENTS.md` files with learnings. This is key because AI coding tools automatically read these files, so future iterations (and future human developers) benefit from discovered patterns, gotchas, and conventions.
+The implement stage updates the relevant `AGENTS.md` files with learnings, and they travel in the pull request. This is key because AI coding tools automatically read these files, so future iterations (and future human developers) benefit from discovered patterns, gotchas, and conventions.
 
 Examples of what to add to AGENTS.md:
 - Patterns discovered ("this codebase uses X for Y")
@@ -347,32 +398,36 @@ Examples of what to add to AGENTS.md:
 Ralph only works if there are feedback loops:
 - Typecheck catches type errors
 - Tests verify behavior
+- The review stages check the work against the spec before it merges
 - CI must stay green (broken code compounds across iterations)
 
-### Browser Verification for UI Stories
+### Browser Verification for UI Tasks
 
-Frontend stories must include "Verify in browser using dev-browser skill" in acceptance criteria. Ralph will use the dev-browser skill to navigate to the page, interact with the UI, and confirm changes work.
+Frontend tasks must include "Verify in browser using dev-browser skill" in acceptance criteria. The functional review opens the page and confirms each criterion by observing it.
 
 ### Stop Condition
 
-When all stories have `passes: true`, Ralph outputs `<promise>COMPLETE</promise>` and the loop exits.
+The agent never decides that the loop is over. The server does: when a worker asks for work and everything is either done or waiting for a person, the answer says `finished` and the loop exits.
 
 ## Debugging
 
 Check current state:
 
 ```bash
-# See which stories are done, and on which model tier
-jq '.userStories[] | {id, title, model, passes}' prd.json
+# Where every task stands (needs the variables of .ralph/env in your shell)
+curl -s -H "Authorization: Bearer $RALPH_API_TOKEN" "$RALPH_API_URL/projects/$RALPH_PROJECT/tasks" |
+  jq -r '.tasks[] | [.id, .state.stage, (if .state.sick then "sick" else "" end), .spec.title] | @tsv'
 
-# See learnings from previous iterations
-cat progress.txt
+# The history of one task: who did what, and what they wrote
+curl -s -H "Authorization: Bearer $RALPH_API_TOKEN" "$RALPH_API_URL/projects/$RALPH_PROJECT/tasks/US-002" |
+  jq -r '.runs[] | "\(.endedAt) \(.stage) \(.outcome) by \(.worker)\n\(.body)\n"'
 
-# Check git history
-git log --oneline -10
+# What the agent of iteration 5 was given, and what it answered
+jq '.task.spec, .task.runs' .ralph/logs/*/iter-05.work.json
+cat .ralph/logs/*/iter-05.result.json
 
-# Cost and window history, last 5 iterations
-jq -s '.[-5:] | .[] | {story, tier, cost_u, pct_delta, subtype}' .ralph/usage.jsonl
+# Cost and window history, last 5 agent runs
+jq -s '.[-5:] | .[] | {task, stage, outcome, tier, cost_u, pct_delta, subtype}' .ralph/usage.jsonl
 
 # Replay a raw iteration transcript
 jq -R 'fromjson? | select(.type == "result")' .ralph/logs/*/iter-05.stream.jsonl
@@ -386,18 +441,17 @@ close - `replay.sh` is the place to start: it shows the server's own reading nex
 percentage that run recorded at the time. The two drifting apart means Ralph was pacing
 on a source that had gone cold.
 
-Run the test suite with `./tests/window.test.sh`.
+Run the test suites with `./tests/api.test.sh` and `./tests/window.test.sh`. Neither
+touches the network.
 
-## Customizing the Prompt
+## Customizing the Prompts
 
-After copying `prompt.md` (for Amp) or `CLAUDE.md` (for Claude Code) to your project, customize it for your project:
-- Add project-specific quality check commands
-- Include codebase conventions
-- Add common gotchas for your stack
+After copying `prompts/` to your project, adapt it:
+- Add project-specific quality check commands and conventions to `_common.md`
+- Add common gotchas for your stack to the stage they affect
+- To change the pipeline, change it in the project (`pipeline` in your `prd.json`, then `--import`) and add or remove the matching `prompts/<stage>.md`. `ralph.sh` refuses to start while a stage has no prompt
 
-## Archiving
-
-Ralph automatically archives previous runs when you start a new feature (different `branchName`). Archives are saved to `archive/YYYY-MM-DD-feature-name/`.
+A stage prompt only describes the work. What the result must carry (`pr`, `assumptions`, `summary`, whether it can `reject`) depends on the position of the stage in the pipeline, and `ralph.sh` adds that to every prompt.
 
 ## References
 

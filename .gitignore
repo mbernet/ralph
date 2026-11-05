@@ -1,13 +1,8 @@
-# Ralph working files (generated during runs)
+# The PRD being prepared for an import (the tasks themselves live in the Ralph API)
 prd.json
-progress.txt
-.last-branch
 
-# Ralph runtime state: usage ledger + per-run logs
+# Ralph runtime state: connection settings, usage ledger and per-run logs
 .ralph/
-
-# Archive is optional to commit
-# archive/
 
 # OS files
 .DS_Store

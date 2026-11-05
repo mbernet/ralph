@@ -100,10 +100,10 @@ story is clearly one of the other two:
 - **`low`** - mechanical work fully determined by the criteria: migrations, seeders,
   factories, CRUD scaffolding that mirrors an existing resource, config, copy.
 - **`med`** - the default. Normal feature work needing a judgment call.
-- **`max`** - cross-cutting work that has to see many files at once ("apply X
+- **`high`** - cross-cutting work that has to see many files at once ("apply X
   everywhere", "across the app"). Expensive; use sparingly.
 
-If you want `max` because a story is big, split the story instead. The `ralph` skill's
+If you want `high` because a story is big, split the story instead. The `ralph` skill's
 "Model Tier" section is authoritative and will re-check whatever you put here.
 
 ### 4. Functional Requirements
